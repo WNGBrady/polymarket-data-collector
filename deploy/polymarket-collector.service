@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket Esports Data Collector
+After=network.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-collector
+ExecStart=/opt/polymarket-collector/venv/bin/python main.py --continuous
+Restart=always
+RestartSec=10
+
+# Ensure logs appear immediately in journald
+Environment=PYTHONUNBUFFERED=1
+
+# Memory guard — leaves ~200MB for the OS on a 1GB droplet
+MemoryMax=800M
+
+# Logging via journald (view with: journalctl -u polymarket-collector -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-collector
+
+[Install]
+WantedBy=multi-user.target
