@@ -2,7 +2,6 @@
 
 import { useState, useMemo } from "react";
 import { useApiData } from "@/lib/hooks";
-import { formatPercent } from "@/lib/format";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 
 interface ClosingLine {
@@ -81,29 +80,26 @@ export default function ClosingLinesPage() {
       })
     : allMatches;
 
-  // Compute filtered stats
-  const filteredStats = useMemo(() => {
+  // Compute stats from visible matches
+  const stats = useMemo(() => {
     if (matches.length === 0) return null;
-    let favoriteWins = 0;
-    let totalConfidence = 0;
+    let favDevTotal = 0;
+    let dogDevTotal = 0;
     for (const [, m] of matches) {
       const home = m.home!;
       const away = m.away!;
       const homeFavored = home.closing_price >= away.closing_price;
       const fav = homeFavored ? home : away;
-      totalConfidence += fav.closing_price;
-      if (fav.team_won === 1) favoriteWins++;
+      const dog = homeFavored ? away : home;
+      favDevTotal += fav.closing_price - fav.min_price;
+      dogDevTotal += dog.closing_price - dog.min_price;
     }
     return {
       total_matches: matches.length,
-      favorite_wins: favoriteWins,
-      favorite_win_rate: favoriteWins / matches.length,
-      avg_confidence: totalConfidence / matches.length,
+      avg_fav_deviation: favDevTotal / matches.length,
+      avg_dog_deviation: dogDevTotal / matches.length,
     };
   }, [matches.length, selectedTournament, rows.length]);
-
-  // Use filtered stats if tournament filter active, otherwise API stats
-  const stats = selectedTournament ? filteredStats : (data?.stats ?? filteredStats);
 
   if (isLoading)
     return (
@@ -184,19 +180,14 @@ export default function ClosingLinesPage() {
           <SummaryStat label="Matches" value={String(stats.total_matches)} />
           <Divider />
           <SummaryStat
-            label="Fav Win Rate"
-            value={formatPercent(stats.favorite_win_rate)}
+            label="Avg Fav Deviation"
+            value={stats.avg_fav_deviation.toFixed(3)}
             color="var(--accent-green)"
           />
           <Divider />
           <SummaryStat
-            label="Fav Record"
-            value={`${stats.favorite_wins}W \u2013 ${stats.total_matches - stats.favorite_wins}L`}
-          />
-          <Divider />
-          <SummaryStat
-            label="Avg Confidence"
-            value={formatPercent(stats.avg_confidence)}
+            label="Avg Dog Deviation"
+            value={stats.avg_dog_deviation.toFixed(3)}
             color="var(--accent-teal)"
           />
         </div>
@@ -209,7 +200,7 @@ export default function ClosingLinesPage() {
             const home = m.home!;
             const away = m.away!;
             const homeFavored = home.closing_price >= away.closing_price;
-            const score = (home.final_score?.replace(/"/g, "") || "").trim();
+            const score = (home.final_score?.replace(/"/g, "").replace(/^0+-0+\|/, "") || "").trim();
             const dateStr = home.game_start_time?.slice(0, 16) || "";
 
             return (
