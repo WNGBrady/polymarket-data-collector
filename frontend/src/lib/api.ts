@@ -4,13 +4,15 @@ export function buildUrl(
   endpoint: string,
   params: { game?: string; date_start?: string; date_end?: string; [key: string]: string | number | undefined }
 ) {
-  const url = new URL(`${API_URL}/api/${endpoint}`);
+  const path = `${API_URL}/api/${endpoint}`;
+  const searchParams = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== "") {
-      url.searchParams.set(key, String(value));
+      searchParams.set(key, String(value));
     }
   }
-  return url.toString();
+  const qs = searchParams.toString();
+  return qs ? `${path}?${qs}` : path;
 }
 
 export async function fetcher<T>(url: string): Promise<T> {
