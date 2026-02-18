@@ -15,7 +15,18 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/charts/
+data/charts_tournament/
 data/*.pdf
+data/*.csv
+
+# API virtual environment
+api/venv/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
 
 # IDE
 .vscode/
@@ -27,3 +38,4 @@ data/*.pdf
 # OS files
 .DS_Store
 Thumbs.db
+nul

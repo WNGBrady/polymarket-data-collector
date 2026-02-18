@@ -14,8 +14,8 @@ RestartSec=10
 # Ensure logs appear immediately in journald
 Environment=PYTHONUNBUFFERED=1
 
-# Memory guard — leaves ~200MB for the OS on a 1GB droplet
-MemoryMax=800M
+# Memory guard — reduced from 800M to leave room for the API service (~100MB)
+MemoryMax=600M
 
 # Logging via journald (view with: journalctl -u polymarket-collector -f)
 StandardOutput=journal

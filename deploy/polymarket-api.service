@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket Esports Dashboard API
+After=network.target
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-collector
+ExecStart=/opt/polymarket-collector/api/venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+
+# Ensure logs appear immediately in journald
+Environment=PYTHONUNBUFFERED=1
+
+# Memory guard — API should stay well under this
+MemoryMax=100M
+
+# Logging via journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-api
+
+[Install]
+WantedBy=multi-user.target
