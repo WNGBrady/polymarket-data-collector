@@ -235,6 +235,7 @@ def extract_market_data(market: Dict[str, Any], event: Optional[Dict[str, Any]] 
         "end_date": market.get("endDate"),
         "event_id": event_id,
         "game_id": game_id,
+        "game_start_time": market.get("gameStartTime"),
     }
 
 

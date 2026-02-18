@@ -16,7 +16,7 @@ from .config import (
     MATCH_SNAPSHOT_DELAY,
     GAMMA_API_URL,
 )
-from .database import get_markets_by_game_id, insert_final_price
+from .database import get_markets_by_game_id, insert_final_price, compute_and_store_closing_lines
 from .historical_collector import fetch_orderbook, process_orderbook
 from .utils import logger, rate_limiter, safe_float, with_retry
 
@@ -178,6 +178,13 @@ class SportsCollector:
                 await self._snapshot_market(market, game_id, data)
             except Exception as e:
                 logger.error(f"  Error snapshotting market {market.get('market_id')}: {e}")
+
+        # Compute and store closing lines
+        try:
+            n = compute_and_store_closing_lines(game_id, data)
+            logger.info(f"  Computed {n} closing lines for gameId={game_id}")
+        except Exception as e:
+            logger.error(f"  Error computing closing lines for {game_id}: {e}")
 
     async def listen(self) -> None:
         """Listen for incoming sports WS messages."""

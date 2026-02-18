@@ -289,6 +289,7 @@ def migrate_database() -> None:
         ("game", "TEXT DEFAULT 'cod'"),
         ("event_id", "TEXT"),
         ("game_id", "TEXT"),
+        ("game_start_time", "TEXT"),
     ]
 
     for col_name, col_type in migrations:
@@ -310,8 +311,8 @@ def upsert_market(market_data: Dict[str, Any]) -> None:
     cursor.execute("""
         INSERT OR REPLACE INTO markets
         (market_id, condition_id, clob_token_id_yes, clob_token_id_no, question, outcomes,
-         start_date, end_date, game, event_id, game_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         start_date, end_date, game, event_id, game_id, game_start_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         market_data.get("market_id"),
         market_data.get("condition_id"),
@@ -324,6 +325,7 @@ def upsert_market(market_data: Dict[str, Any]) -> None:
         market_data.get("game", "cod"),
         market_data.get("event_id"),
         market_data.get("game_id"),
+        market_data.get("game_start_time"),
     ))
 
     conn.commit()
@@ -499,6 +501,168 @@ def upsert_game_id_mapping(game_id: str, market_id: str, event_id: Optional[str]
     """, (game_id, market_id, event_id, game))
 
     conn.commit()
+
+
+def insert_closing_line(
+    game_id: str,
+    market_id: str,
+    home_team: Optional[str],
+    away_team: Optional[str],
+    team: str,
+    is_home: bool,
+    question: Optional[str],
+    game_start_time: Optional[str],
+    closing_price: float,
+    min_price: float,
+    max_price: float,
+    final_score: Optional[str],
+    team_won: Optional[bool],
+    n_trades: int,
+) -> None:
+    """Insert a closing line row."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO closing_lines
+        (game_id, market_id, home_team, away_team, team,
+         is_home, question, game_start_time,
+         closing_price, min_price, max_price,
+         final_score, team_won, n_trades)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        game_id, market_id, home_team, away_team, team,
+        1 if is_home else 0, question, game_start_time,
+        closing_price, min_price, max_price,
+        final_score,
+        (1 if team_won else 0) if team_won is not None else None,
+        n_trades,
+    ))
+
+    conn.commit()
+
+
+def compute_and_store_closing_lines(game_id: str, match_data: Dict[str, Any]) -> int:
+    """Compute closing lines from trade data and store them for a finished match.
+
+    Returns the number of closing line rows inserted.
+    """
+    from .utils import logger
+
+    markets = get_markets_by_game_id(game_id)
+    if not markets:
+        return 0
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    home_team = match_data.get("homeTeam")
+    away_team = match_data.get("awayTeam")
+    score = match_data.get("score")
+    final_score = json.dumps(score) if score else None
+
+    inserted = 0
+
+    for market in markets:
+        market_id = market.get("market_id")
+        question = market.get("question")
+        gst_str = market.get("game_start_time")
+
+        if not gst_str or not market_id:
+            continue
+
+        # Parse game_start_time to epoch seconds
+        try:
+            from datetime import datetime, timezone
+            # Handle formats like "2026-02-14 08:30:00+00" or ISO
+            gst_str_clean = gst_str.replace("+00", "+00:00") if gst_str.endswith("+00") else gst_str
+            gst_dt = datetime.fromisoformat(gst_str_clean)
+            if gst_dt.tzinfo is None:
+                gst_dt = gst_dt.replace(tzinfo=timezone.utc)
+            gst_ts = gst_dt.timestamp()
+        except Exception as e:
+            logger.warning(f"  Could not parse game_start_time '{gst_str}' for {market_id}: {e}")
+            continue
+
+        # Get pre-match trades for this market
+        cursor.execute("""
+            SELECT outcome, price, timestamp FROM trades
+            WHERE market_id = ? AND timestamp < ?
+            ORDER BY timestamp ASC
+        """, (market_id, gst_ts))
+        trades = cursor.fetchall()
+
+        if not trades:
+            continue
+
+        # Determine winner from final_prices
+        cursor.execute("""
+            SELECT last_trade_price FROM final_prices
+            WHERE market_id = ? ORDER BY id DESC LIMIT 1
+        """, (market_id,))
+        fp_row = cursor.fetchone()
+        home_won = None
+        if fp_row and fp_row["last_trade_price"] is not None:
+            home_won = fp_row["last_trade_price"] > 0.5
+
+        # Group trades by outcome
+        outcome_trades: Dict[str, list] = {}
+        for t in trades:
+            outcome = t["outcome"]
+            if outcome not in outcome_trades:
+                outcome_trades[outcome] = []
+            outcome_trades[outcome].append({"price": t["price"], "timestamp": t["timestamp"]})
+
+        # Compute closing line for each team
+        for team_name in [home_team, away_team]:
+            if not team_name:
+                continue
+            is_home = (team_name == home_team)
+
+            if team_name in outcome_trades and outcome_trades[team_name]:
+                team_trades = outcome_trades[team_name]
+                # Last trade = highest timestamp
+                last_trade = max(team_trades, key=lambda t: t["timestamp"])
+                closing_price = last_trade["price"]
+                min_price = min(t["price"] for t in team_trades)
+                max_price = max(t["price"] for t in team_trades)
+                n_trades = len(team_trades)
+            else:
+                # No direct trades — infer from the other side
+                other_team = away_team if is_home else home_team
+                if other_team not in outcome_trades or not outcome_trades[other_team]:
+                    continue
+                other_trades = outcome_trades[other_team]
+                last_other = max(other_trades, key=lambda t: t["timestamp"])
+                closing_price = 1 - last_other["price"]
+                min_price = 1 - max(t["price"] for t in other_trades)
+                max_price = 1 - min(t["price"] for t in other_trades)
+                n_trades = 0
+
+            if home_won is not None:
+                team_won = (is_home and home_won) or (not is_home and not home_won)
+            else:
+                team_won = None
+
+            insert_closing_line(
+                game_id=game_id,
+                market_id=market_id,
+                home_team=home_team,
+                away_team=away_team,
+                team=team_name,
+                is_home=is_home,
+                question=question,
+                game_start_time=gst_str,
+                closing_price=closing_price,
+                min_price=min_price,
+                max_price=max_price,
+                final_score=final_score,
+                team_won=team_won,
+                n_trades=n_trades,
+            )
+            inserted += 1
+
+    return inserted
 
 
 # ---------------------------------------------------------------------------
