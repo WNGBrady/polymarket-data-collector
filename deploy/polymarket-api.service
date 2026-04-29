@@ -14,8 +14,9 @@ RestartSec=5
 # Ensure logs appear immediately in journald
 Environment=PYTHONUNBUFFERED=1
 
-# Memory guard — API should stay well under this
-MemoryMax=100M
+# Memory guard. Note that mmap_size from api/db.py counts toward this on
+# cgroup v2 — keep enough headroom for the page cache on top of RSS.
+MemoryMax=256M
 
 # Logging via journald
 StandardOutput=journal
