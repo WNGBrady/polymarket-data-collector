@@ -26,9 +26,10 @@ def _get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
-    # Modest private cache; the real win is mmap below, which is shared via
-    # the OS page cache and doesn't multiply by threadpool size.
-    conn.execute("PRAGMA cache_size = -16000")
+    # Small private cache: this multiplies by the threadpool size and the
+    # systemd unit caps the API at MemoryMax=100M. The real perf win is mmap
+    # below, which is shared via the OS page cache.
+    conn.execute("PRAGMA cache_size = -4000")
     conn.execute("PRAGMA mmap_size = 268435456")
 
     _local.conn = conn
