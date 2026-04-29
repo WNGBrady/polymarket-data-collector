@@ -8,10 +8,23 @@ from collections import OrderedDict
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from .config import WEBSOCKET_URL, ORDERBOOK_POLL_INTERVAL
+from .config import (
+    WEBSOCKET_URL,
+    ORDERBOOK_POLL_INTERVAL,
+    FAST_ORDERBOOK_POLL_INTERVAL,
+    TIER1_CS2_KEYWORDS,
+)
 from .database import get_all_markets, buffer_realtime_price, flush_all_buffers, insert_orderbook_snapshot
 from .historical_collector import fetch_orderbook, process_orderbook
 from .utils import logger, safe_float
+
+
+def is_tier1_cs2_market(market: Dict[str, Any]) -> bool:
+    """True for CS2 markets whose question mentions a tier-1 tournament keyword."""
+    if market.get("game") != "cs2":
+        return False
+    question = (market.get("question") or "").lower()
+    return any(kw in question for kw in TIER1_CS2_KEYWORDS)
 
 
 class DeduplicationCache:
@@ -79,6 +92,7 @@ class RealtimeCollector:
         self.enable_orderbook_polling = enable_orderbook_polling
         self.markets: List[Dict[str, Any]] = []
         self._orderbook_task: Optional[asyncio.Task] = None
+        self._orderbook_fast_task: Optional[asyncio.Task] = None
 
     async def connect(self) -> bool:
         """Establish WebSocket connection."""
@@ -243,8 +257,34 @@ class RealtimeCollector:
         except Exception as e:
             logger.error(f"Error in WebSocket listener: {e}")
 
+    def _snapshot_market(self, market: Dict[str, Any]) -> None:
+        """Fetch + persist a single orderbook snapshot. Swallows per-market errors."""
+        token_id = market.get("clob_token_id_yes")
+        market_id = market.get("market_id")
+        if not token_id:
+            return
+        try:
+            book_data = fetch_orderbook(token_id)
+            processed = process_orderbook(book_data)
+            timestamp = int(time.time() * 1000)
+            insert_orderbook_snapshot(
+                market_id=market_id,
+                token_id=token_id,
+                timestamp=timestamp,
+                best_bid_price=processed["best_bid_price"],
+                best_bid_size=processed["best_bid_size"],
+                best_ask_price=processed["best_ask_price"],
+                best_ask_size=processed["best_ask_size"],
+                spread=processed["spread"],
+                mid_price=processed["mid_price"],
+                bid_depth=processed["bid_depth"],
+                ask_depth=processed["ask_depth"],
+            )
+        except Exception as e:
+            logger.debug(f"Error polling orderbook for {str(market_id)[:20]}...: {e}")
+
     async def _poll_orderbooks(self) -> None:
-        """Periodically poll orderbook data for all markets."""
+        """Default-tier orderbook polling. Skips tier-1 CS2 markets handled by the fast loop."""
         logger.info(f"Starting orderbook polling (every {ORDERBOOK_POLL_INTERVAL}s)...")
 
         while self.running:
@@ -252,46 +292,52 @@ class RealtimeCollector:
                 for market in self.markets:
                     if not self.running:
                         break
-
-                    token_id = market.get("clob_token_id_yes")
-                    market_id = market.get("market_id")
-
-                    if not token_id:
+                    if is_tier1_cs2_market(market):
                         continue
-
-                    try:
-                        book_data = fetch_orderbook(token_id)
-                        processed = process_orderbook(book_data)
-
-                        timestamp = int(time.time() * 1000)
-
-                        insert_orderbook_snapshot(
-                            market_id=market_id,
-                            token_id=token_id,
-                            timestamp=timestamp,
-                            best_bid_price=processed["best_bid_price"],
-                            best_bid_size=processed["best_bid_size"],
-                            best_ask_price=processed["best_ask_price"],
-                            best_ask_size=processed["best_ask_size"],
-                            spread=processed["spread"],
-                            mid_price=processed["mid_price"],
-                            bid_depth=processed["bid_depth"],
-                            ask_depth=processed["ask_depth"],
-                        )
-
-                    except Exception as e:
-                        logger.debug(f"Error polling orderbook for {market_id[:20]}...: {e}")
-
-                    # Small delay between markets
+                    self._snapshot_market(market)
                     await asyncio.sleep(0.1)
 
-                # Wait before next polling round
                 await asyncio.sleep(ORDERBOOK_POLL_INTERVAL)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in orderbook polling: {e}")
+                await asyncio.sleep(5)
+
+    async def _poll_orderbooks_fast(self) -> None:
+        """Fast-tier orderbook polling for tier-1 CS2 markets (IEM, ESL Pro League, BLAST, PGL)."""
+        logger.info(
+            f"Starting fast orderbook polling (every {FAST_ORDERBOOK_POLL_INTERVAL}s) "
+            f"for tier-1 CS2 markets..."
+        )
+
+        while self.running:
+            try:
+                round_start = time.time()
+                tier1 = [m for m in self.markets if is_tier1_cs2_market(m)]
+
+                for market in tier1:
+                    if not self.running:
+                        break
+                    self._snapshot_market(market)
+                    await asyncio.sleep(0.02)
+
+                elapsed = time.time() - round_start
+                remaining = FAST_ORDERBOOK_POLL_INTERVAL - elapsed
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                else:
+                    logger.warning(
+                        f"Fast orderbook round took {elapsed:.1f}s "
+                        f"(>{FAST_ORDERBOOK_POLL_INTERVAL}s target, {len(tier1)} markets)"
+                    )
+                    await asyncio.sleep(0)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in fast orderbook polling: {e}")
                 await asyncio.sleep(5)
 
     async def run(self, markets: Optional[List[Dict[str, Any]]] = None) -> None:
@@ -328,6 +374,7 @@ class RealtimeCollector:
         # Start orderbook polling if enabled
         if self.enable_orderbook_polling:
             self._orderbook_task = asyncio.create_task(self._poll_orderbooks())
+            self._orderbook_fast_task = asyncio.create_task(self._poll_orderbooks_fast())
 
         try:
             while self.running:
@@ -345,13 +392,14 @@ class RealtimeCollector:
                         self.max_reconnect_delay
                     )
         finally:
-            # Clean up orderbook polling task
-            if self._orderbook_task:
-                self._orderbook_task.cancel()
-                try:
-                    await self._orderbook_task
-                except asyncio.CancelledError:
-                    pass
+            # Clean up orderbook polling tasks
+            for task in (self._orderbook_task, self._orderbook_fast_task):
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
     def stop(self) -> None:
         """Stop the real-time collector."""

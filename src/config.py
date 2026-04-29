@@ -219,8 +219,14 @@ INITIAL_BACKOFF = 1  # seconds
 MAX_BACKOFF = 60  # seconds
 
 # Orderbook settings
-ORDERBOOK_POLL_INTERVAL = 60  # seconds between orderbook snapshots
+ORDERBOOK_POLL_INTERVAL = 60  # seconds between orderbook snapshots (default tier)
 ORDERBOOK_DEPTH = 5  # Number of price levels to store
+
+# Fast-tier orderbook polling for tier-1 CS2 events (IEM, ESL Pro League, BLAST, PGL).
+# Markets matching TIER1_CS2_KEYWORDS in their question are polled on this faster cadence
+# and skipped by the default-tier loop to avoid double work.
+FAST_ORDERBOOK_POLL_INTERVAL = 10  # seconds
+TIER1_CS2_KEYWORDS = ["iem", "esl pro league", "blast", "pgl"]
 
 # Continuous mode settings
 DISCOVERY_INTERVAL = 1800  # 30 minutes between market discovery runs
