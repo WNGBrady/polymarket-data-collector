@@ -5,25 +5,34 @@ WAL mode (set by the collector) allows unlimited concurrent readers.
 """
 
 import sqlite3
+import threading
 from typing import Any
 
 from .config import DB_PATH
 
-_conn: sqlite3.Connection | None = None
+_local = threading.local()
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Return a shared read-only connection, creating on first call."""
-    global _conn
-    if _conn is not None:
-        return _conn
+    """Return a thread-local read-only connection, creating on first call."""
+    conn: sqlite3.Connection | None = getattr(_local, "conn", None)
+    if conn is not None:
+        return conn
 
     uri = f"file:{DB_PATH}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    # Thread-local (not shared) so concurrent FastAPI requests don't serialize
+    # on a single connection's GIL-protected execute.
+    conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
-    _conn = conn
-    return _conn
+    conn.execute("PRAGMA busy_timeout = 5000")
+    # Modest private cache; the real win is mmap below, which is shared via
+    # the OS page cache and doesn't multiply by threadpool size.
+    conn.execute("PRAGMA cache_size = -16000")
+    conn.execute("PRAGMA mmap_size = 268435456")
+
+    _local.conn = conn
+    return conn
 
 
 def query_all(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
