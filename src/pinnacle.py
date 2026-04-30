@@ -250,40 +250,52 @@ def infer_map_num(question: str) -> int:
     return 0
 
 
-def extract_team_candidates(question: str) -> List[str]:
-    """Best-effort split of a polymarket question into candidate team strings.
+def _clean_team_side(s: str) -> str:
+    """Strip game/league prefixes and trailing details from one side of a vs split.
 
-    Polymarket questions take many shapes:
+    Real polymarket samples we need to handle:
+      "Counter-Strike: Natus Vincere"        -> "Natus Vincere"
+      "Map Handicap: NAVI (-1.5)"            -> "NAVI"
+      "Will Vitality"                        -> "Vitality"
+      "GamerLegion (BO3) - BLAST Rivals..."  -> "GamerLegion"
+      "Spirit - Map 2 Winner"                -> "Spirit"
+    """
+    # Strip leading "X:" prefix (game name, market type, etc.). Bound to the
+    # first colon — runs at most once so a team name with a colon survives.
+    s = re.sub(r"^[^:]+:\s*", "", s, count=1).strip()
+    # Strip leading "Will " / "Will the " conversational lead-ins
+    s = re.sub(r"^will(\s+the)?\s+", "", s, flags=re.IGNORECASE).strip()
+    # Strip trailing parenthetical (and anything after it: tournament tags, etc.)
+    s = re.sub(r"\s*\([^)]*\).*$", "", s).strip()
+    # Strip trailing " - <suffix>" or " — <suffix>"
+    s = re.sub(r"\s*[—\-]\s.*$", "", s).strip()
+    return s
+
+
+def extract_team_candidates(question: str) -> List[str]:
+    """Best-effort split of a polymarket question into [home, away] team names.
+
+    Polymarket CS2 questions take many shapes:
       "Will Vitality beat Spirit?"
       "Vitality vs G2"
-      "Vitality vs Spirit — Map 3 winner"
-    Returns up to 4 candidate strings, ordered most→least confident.
+      "Counter-Strike: Natus Vincere vs GamerLegion - Map 2 Winner"
+      "Map Handicap: NAVI (-1.5) vs GamerLegion (+1.5)"
     """
     if not question:
         return []
-    q = question.strip()
-    # Strip common suffixes that pollute matching
-    q = re.split(r"\s*[—\-:]\s*", q)[0]
-    q = re.sub(r"\?$", "", q)
+    q = question.strip().rstrip("?")
 
     parts = _VS_RE.split(q, maxsplit=1)
-    if len(parts) == 2:
-        left = parts[0].strip()
-        right = parts[1].strip()
-        # Strip leading "Will " from the left side
-        left = re.sub(r"^will\s+", "", left, flags=re.IGNORECASE).strip()
-        # Strip "beat ..." trailing on the right (only happens when no vs/@)
-        return [c for c in [left, right] if c]
+    if len(parts) != 2:
+        bm = re.search(r"\b(beats?|defeats?|wins against)\b", q, flags=re.IGNORECASE)
+        if bm:
+            parts = [q[:bm.start()], q[bm.end():]]
+        else:
+            return [q.strip()] if q.strip() else []
 
-    # No "vs" — try splitting on "beat" or "to defeat"
-    bm = re.search(r"\b(beat|defeat|defeats|win against)\b", q, flags=re.IGNORECASE)
-    if bm:
-        left = q[:bm.start()].strip()
-        right = q[bm.end():].strip()
-        left = re.sub(r"^will\s+", "", left, flags=re.IGNORECASE).strip()
-        return [c for c in [left, right] if c]
-
-    return [q]
+    left = _clean_team_side(parts[0])
+    right = _clean_team_side(parts[1])
+    return [c for c in [left, right] if c]
 
 
 def fuzzy_match_market(
