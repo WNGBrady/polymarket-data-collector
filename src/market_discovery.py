@@ -4,7 +4,7 @@ import json
 import requests
 from typing import List, Dict, Any, Optional, Set
 
-from .config import GAMMA_API_URL, GAME_CONFIGS, VALID_GAMES, get_game_config
+from .config import GAMMA_API_URL, GAME_CONFIGS, TIER1_CS2_KEYWORDS, VALID_GAMES, get_game_config
 from .database import upsert_market, get_all_markets, upsert_game_id_mapping
 from .utils import rate_limiter, with_retry, logger
 
@@ -46,6 +46,21 @@ def is_game_related(event: Dict[str, Any], market: Dict[str, Any], game: str) ->
     return False
 
 
+def _passes_tier_filter(event: Dict[str, Any], market: Dict[str, Any], game: str) -> bool:
+    """Tournament-tier gate. CS2 has hundreds of low-tier ladder/qualifier matches
+    on Polymarket; we only want tier-1 leagues (BLAST/IEM/ESL Pro/PGL) to keep
+    the realtime poll loop tractable on the 1 GB droplet. COD is unrestricted —
+    its only league (CDL) is already implicitly filtered by validation_terms."""
+    if game != "cs2":
+        return True
+    text = " ".join([
+        event.get("title") or "",
+        market.get("question") or "",
+        market.get("groupItemTitle") or "",
+    ]).lower()
+    return any(kw in text for kw in TIER1_CS2_KEYWORDS)
+
+
 @with_retry
 def public_search(query: str, page: int = 1, limit: int = 100) -> Dict[str, Any]:
     """
@@ -77,22 +92,38 @@ def public_search(query: str, page: int = 1, limit: int = 100) -> Dict[str, Any]
 
 @with_retry
 def fetch_all_tags() -> List[Dict[str, Any]]:
-    """Fetch all available tags from the API."""
-    rate_limiter.wait_if_needed("gamma_tags")
+    """Fetch all available tags from the API.
 
+    The /tags endpoint defaults to 100 results and caps each response at 300 —
+    the esports/CS2/CoD tags live well past offset 600, so we paginate."""
     url = f"{GAMMA_API_URL}/tags"
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
+    page_size = 300
+    offset = 0
+    all_tags: List[Dict[str, Any]] = []
 
-    data = response.json()
+    while True:
+        rate_limiter.wait_if_needed("gamma_tags")
+        response = requests.get(
+            url, params={"limit": page_size, "offset": offset}, timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
 
-    # Handle different response formats
-    if isinstance(data, list):
-        return data
-    elif isinstance(data, dict):
-        return data.get("tags", []) or data.get("data", [])
+        if isinstance(data, list):
+            page = data
+        elif isinstance(data, dict):
+            page = data.get("tags", []) or data.get("data", []) or []
+        else:
+            page = []
 
-    return []
+        if not page:
+            break
+        all_tags.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return all_tags
 
 
 def find_esports_tags(tags: List[Dict[str, Any]], tag_labels: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -128,7 +159,7 @@ def find_esports_tags(tags: List[Dict[str, Any]], tag_labels: Optional[List[str]
 
 
 @with_retry
-def fetch_events_by_tag(tag_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+def fetch_events_by_tag(tag_id: str, limit: int = 500) -> List[Dict[str, Any]]:
     """
     Fetch events filtered by tag ID.
 
@@ -141,7 +172,7 @@ def fetch_events_by_tag(tag_id: str, limit: int = 100) -> List[Dict[str, Any]]:
     url = f"{GAMMA_API_URL}/events"
     params = {
         "tag_id": tag_id,
-        "_limit": limit,
+        "limit": limit,
         "closed": False,
     }
 
@@ -282,6 +313,8 @@ def discover_game_markets(game: str, include_closed: bool = False) -> List[Dict[
 
                             if not is_game_related(event, market, game):
                                 continue
+                            if not _passes_tier_filter(event, market, game):
+                                continue
 
                             seen_ids.add(market_id)
                             market_data = extract_market_data(market, event)
@@ -366,6 +399,8 @@ def discover_markets_by_tags(game: Optional[str] = None, include_closed: bool = 
                                     break
 
                             if not matched_game:
+                                continue
+                            if not _passes_tier_filter(event, market, matched_game):
                                 continue
 
                             seen_ids.add(market_id)
