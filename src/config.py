@@ -242,3 +242,12 @@ MATCH_SNAPSHOT_DELAY = 2  # seconds to wait after match end before snapshotting
 PINNACLE_API_URL = os.environ.get("PINNACLE_API_URL", "http://127.0.0.1:8765")
 PINNACLE_HTTP_TIMEOUT = float(os.environ.get("PINNACLE_HTTP_TIMEOUT", "0.5"))
 PINNACLE_FUZZY_THRESHOLD = float(os.environ.get("PINNACLE_FUZZY_THRESHOLD", "0.85"))
+
+# Trading + sportsbook flags. main.py imports these unconditionally; the
+# corresponding code paths are gated behind these flags and only run when
+# explicitly enabled via env vars. Defaults disable both so the collector can
+# boot without the optional src/trading and src/sportsbook modules present.
+TRADING_ENABLED = os.environ.get("TRADING_ENABLED", "").lower() in {"1", "true", "yes"}
+SPORTSBOOK_ENABLED = os.environ.get("SPORTSBOOK_ENABLED", "").lower() in {"1", "true", "yes"}
+SIGNAL_SCAN_INTERVAL = int(os.environ.get("SIGNAL_SCAN_INTERVAL", "30"))
+ORDER_CHECK_INTERVAL = int(os.environ.get("ORDER_CHECK_INTERVAL", "60"))
