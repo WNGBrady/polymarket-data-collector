@@ -12,6 +12,7 @@ from .config import (
     WEBSOCKET_URL,
     ORDERBOOK_POLL_INTERVAL,
     FAST_ORDERBOOK_POLL_INTERVAL,
+    FAST_ORDERBOOK_CONCURRENCY,
     TIER1_CS2_KEYWORDS,
 )
 from .database import get_all_markets, buffer_realtime_price, flush_all_buffers, insert_orderbook_snapshot
@@ -266,22 +267,38 @@ class RealtimeCollector:
         try:
             book_data = fetch_orderbook(token_id)
             processed = process_orderbook(book_data)
-            timestamp = int(time.time() * 1000)
-            insert_orderbook_snapshot(
-                market_id=market_id,
-                token_id=token_id,
-                timestamp=timestamp,
-                best_bid_price=processed["best_bid_price"],
-                best_bid_size=processed["best_bid_size"],
-                best_ask_price=processed["best_ask_price"],
-                best_ask_size=processed["best_ask_size"],
-                spread=processed["spread"],
-                mid_price=processed["mid_price"],
-                bid_depth=processed["bid_depth"],
-                ask_depth=processed["ask_depth"],
-            )
+            self._persist_snapshot(market_id, token_id, processed, int(time.time() * 1000))
         except Exception as e:
             logger.debug(f"Error polling orderbook for {str(market_id)[:20]}...: {e}")
+
+    def _persist_snapshot(self, market_id: str, token_id: str, processed: Dict[str, Any], timestamp: int) -> None:
+        insert_orderbook_snapshot(
+            market_id=market_id,
+            token_id=token_id,
+            timestamp=timestamp,
+            best_bid_price=processed["best_bid_price"],
+            best_bid_size=processed["best_bid_size"],
+            best_ask_price=processed["best_ask_price"],
+            best_ask_size=processed["best_ask_size"],
+            spread=processed["spread"],
+            mid_price=processed["mid_price"],
+            bid_depth=processed["bid_depth"],
+            ask_depth=processed["ask_depth"],
+        )
+
+    async def _fetch_orderbook_async(self, market: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[str, Any], int]]:
+        """Fetch one orderbook off the event loop. Returns a persistable tuple, or None on error/skip."""
+        token_id = market.get("clob_token_id_yes")
+        market_id = market.get("market_id")
+        if not token_id:
+            return None
+        try:
+            book_data = await asyncio.to_thread(fetch_orderbook, token_id)
+            processed = process_orderbook(book_data)
+            return (market_id, token_id, processed, int(time.time() * 1000))
+        except Exception as e:
+            logger.debug(f"Error fetching orderbook for {str(market_id)[:20]}...: {e}")
+            return None
 
     async def _poll_orderbooks(self) -> None:
         """Default-tier orderbook polling. Skips tier-1 CS2 markets handled by the fast loop."""
@@ -306,22 +323,43 @@ class RealtimeCollector:
                 await asyncio.sleep(5)
 
     async def _poll_orderbooks_fast(self) -> None:
-        """Fast-tier orderbook polling for tier-1 CS2 markets (IEM, ESL Pro League, BLAST, PGL)."""
+        """Fast-tier orderbook polling for tier-1 CS2 markets (IEM, ESL Pro League, BLAST, PGL).
+
+        HTTP fetches run in parallel via a thread pool (semaphore-limited concurrency).
+        DB inserts stay sequential on the event loop to avoid SQLite contention with the
+        slow loop, which shares the same connection without a write lock around inserts.
+        """
         logger.info(
-            f"Starting fast orderbook polling (every {FAST_ORDERBOOK_POLL_INTERVAL}s) "
-            f"for tier-1 CS2 markets..."
+            f"Starting fast orderbook polling (every {FAST_ORDERBOOK_POLL_INTERVAL}s, "
+            f"concurrency={FAST_ORDERBOOK_CONCURRENCY}) for tier-1 CS2 markets..."
         )
+
+        sem = asyncio.Semaphore(FAST_ORDERBOOK_CONCURRENCY)
+
+        async def fetch_with_sem(m):
+            async with sem:
+                if not self.running:
+                    return None
+                return await self._fetch_orderbook_async(m)
 
         while self.running:
             try:
                 round_start = time.time()
                 tier1 = [m for m in self.markets if is_tier1_cs2_market(m)]
 
-                for market in tier1:
-                    if not self.running:
-                        break
-                    self._snapshot_market(market)
-                    await asyncio.sleep(0.02)
+                if tier1:
+                    results = await asyncio.gather(
+                        *(fetch_with_sem(m) for m in tier1),
+                        return_exceptions=False,
+                    )
+                    for r in results:
+                        if r is None:
+                            continue
+                        market_id, token_id, processed, ts = r
+                        try:
+                            self._persist_snapshot(market_id, token_id, processed, ts)
+                        except Exception as e:
+                            logger.debug(f"Error persisting snapshot {str(market_id)[:20]}...: {e}")
 
                 elapsed = time.time() - round_start
                 remaining = FAST_ORDERBOOK_POLL_INTERVAL - elapsed

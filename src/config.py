@@ -226,6 +226,7 @@ ORDERBOOK_DEPTH = 5  # Number of price levels to store
 # Markets matching TIER1_CS2_KEYWORDS in their question are polled on this faster cadence
 # and skipped by the default-tier loop to avoid double work.
 FAST_ORDERBOOK_POLL_INTERVAL = 10  # seconds
+FAST_ORDERBOOK_CONCURRENCY = 8  # parallel HTTP fetches per fast-tier round
 TIER1_CS2_KEYWORDS = ["iem", "esl pro league", "blast", "pgl"]
 
 # Continuous mode settings
