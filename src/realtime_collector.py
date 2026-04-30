@@ -15,8 +15,17 @@ from .config import (
     FAST_ORDERBOOK_CONCURRENCY,
     TIER1_CS2_KEYWORDS,
 )
-from .database import get_all_markets, buffer_realtime_price, flush_all_buffers, insert_orderbook_snapshot
+from .database import (
+    get_all_markets,
+    buffer_realtime_price,
+    flush_all_buffers,
+    insert_orderbook_snapshot,
+    get_pinnacle_link,
+    upsert_pinnacle_link,
+    insert_pinnacle_snapshot,
+)
 from .historical_collector import fetch_orderbook, process_orderbook
+from . import pinnacle
 from .utils import logger, safe_float
 
 
@@ -267,13 +276,13 @@ class RealtimeCollector:
         try:
             book_data = fetch_orderbook(token_id)
             processed = process_orderbook(book_data)
-            self._persist_snapshot(market_id, token_id, processed, int(time.time() * 1000))
+            self._persist_snapshot(market, token_id, processed, int(time.time() * 1000))
         except Exception as e:
             logger.debug(f"Error polling orderbook for {str(market_id)[:20]}...: {e}")
 
-    def _persist_snapshot(self, market_id: str, token_id: str, processed: Dict[str, Any], timestamp: int) -> None:
-        insert_orderbook_snapshot(
-            market_id=market_id,
+    def _persist_snapshot(self, market: Dict[str, Any], token_id: str, processed: Dict[str, Any], timestamp: int) -> None:
+        ob_id = insert_orderbook_snapshot(
+            market_id=market.get("market_id"),
             token_id=token_id,
             timestamp=timestamp,
             best_bid_price=processed["best_bid_price"],
@@ -285,8 +294,94 @@ class RealtimeCollector:
             bid_depth=processed["bid_depth"],
             ask_depth=processed["ask_depth"],
         )
+        # Pinnacle attach is best-effort: any failure (cs2odds down, unmatched
+        # market, fuzzy still in flight) leaves the orderbook row unmodified.
+        try:
+            self._maybe_attach_pinnacle(market, ob_id, timestamp)
+        except Exception as e:
+            logger.debug(f"pinnacle attach failed for {str(market.get('market_id'))[:20]}...: {e}")
 
-    async def _fetch_orderbook_async(self, market: Dict[str, Any]) -> Optional[Tuple[str, str, Dict[str, Any], int]]:
+    def _maybe_attach_pinnacle(
+        self, market: Dict[str, Any], ob_id: Optional[int], timestamp: int
+    ) -> None:
+        """If this market is CS2 and has (or can obtain) a pinnacle link, write a
+        time-aligned pinnacle_snapshots row tied to the orderbook row."""
+        if market.get("game") != "cs2":
+            return
+        market_id = market.get("market_id")
+        if not market_id:
+            return
+
+        link = get_pinnacle_link(market_id)
+        if link is None:
+            link = self._auto_link_market(market)
+            if link is None:
+                return  # cs2odds unreachable — will retry next snapshot
+
+        method = link.get("link_method")
+        pin_match_id = link.get("pin_match_id")
+        if method != "auto-fuzzy" and method != "manual":
+            return
+        if pin_match_id is None:
+            return
+
+        odds = pinnacle.fetch_match_odds(pin_match_id)
+        if odds is None:
+            return
+
+        pin_map_num = link.get("pin_map_num") or 0
+        snap = pinnacle.extract_snapshot_for_map(odds, pin_map_num)
+        if snap is None:
+            return
+
+        insert_pinnacle_snapshot(
+            orderbook_snapshot_id=ob_id,
+            market_id=market_id,
+            pin_match_id=pin_match_id,
+            timestamp=timestamp,
+            **snap,
+        )
+
+    def _auto_link_market(self, market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """One-shot fuzzy-match attempt. Persists the result (or the 'unmatched'
+        sentinel) so we don't re-search every snapshot. Returns the link row on
+        success, or None if cs2odds is currently unreachable (in which case we
+        leave the link unattempted and retry on the next snapshot)."""
+        market_id = market.get("market_id")
+        method, pin_match, confidence = pinnacle.attempt_link_for_market(market)
+
+        if method == "pinnacle-down":
+            return None
+
+        if method == "unmatched":
+            upsert_pinnacle_link(
+                market_id=market_id,
+                pin_match_id=None, pin_map_num=None,
+                home_team=None, away_team=None,
+                link_method="unmatched", confidence=None,
+            )
+            logger.info(f"pinnacle: no match for '{(market.get('question') or '')[:60]}'")
+            return get_pinnacle_link(market_id)
+
+        # auto-fuzzy hit
+        map_num = pinnacle.infer_map_num(market.get("question") or "")
+        upsert_pinnacle_link(
+            market_id=market_id,
+            pin_match_id=pin_match.get("match_id"),
+            pin_map_num=map_num,
+            home_team=pin_match.get("home"),
+            away_team=pin_match.get("away"),
+            link_method="auto-fuzzy",
+            confidence=confidence,
+        )
+        logger.info(
+            f"pinnacle: linked '{(market.get('question') or '')[:50]}' -> "
+            f"{pin_match.get('home')} vs {pin_match.get('away')} "
+            f"(match_id={pin_match.get('match_id')}, map={map_num}, conf={confidence:.2f})"
+        )
+        return get_pinnacle_link(market_id)
+
+    async def _fetch_orderbook_async(self, market: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], str, Dict[str, Any], int]]:
         """Fetch one orderbook off the event loop. Returns a persistable tuple, or None on error/skip."""
         token_id = market.get("clob_token_id_yes")
         market_id = market.get("market_id")
@@ -295,7 +390,7 @@ class RealtimeCollector:
         try:
             book_data = await asyncio.to_thread(fetch_orderbook, token_id)
             processed = process_orderbook(book_data)
-            return (market_id, token_id, processed, int(time.time() * 1000))
+            return (market, token_id, processed, int(time.time() * 1000))
         except Exception as e:
             logger.debug(f"Error fetching orderbook for {str(market_id)[:20]}...: {e}")
             return None
@@ -355,11 +450,11 @@ class RealtimeCollector:
                     for r in results:
                         if r is None:
                             continue
-                        market_id, token_id, processed, ts = r
+                        market, token_id, processed, ts = r
                         try:
-                            self._persist_snapshot(market_id, token_id, processed, ts)
+                            self._persist_snapshot(market, token_id, processed, ts)
                         except Exception as e:
-                            logger.debug(f"Error persisting snapshot {str(market_id)[:20]}...: {e}")
+                            logger.debug(f"Error persisting snapshot {str(market.get('market_id'))[:20]}...: {e}")
 
                 elapsed = time.time() - round_start
                 remaining = FAST_ORDERBOOK_POLL_INTERVAL - elapsed

@@ -245,6 +245,52 @@ def init_database() -> None:
         )
     """)
 
+    # Pinnacle (ps3838) match-to-market link.
+    # One row per polymarket market that has been resolved (or attempted) against
+    # a ps3838 event id + map number. link_method='unmatched' is a sentinel that
+    # means "we tried fuzzy-matching and couldn't find a counterpart" — it stops
+    # us re-running the fuzzy search every snapshot.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pinnacle_match_links (
+            market_id      TEXT PRIMARY KEY,
+            pin_match_id   INTEGER,
+            pin_map_num    INTEGER,
+            home_team      TEXT,
+            away_team      TEXT,
+            link_method    TEXT,
+            confidence     REAL,
+            linked_at      INTEGER,
+            FOREIGN KEY (market_id) REFERENCES markets(market_id)
+        )
+    """)
+
+    # Per-snapshot pinnacle odds, paired with a polymarket orderbook snapshot.
+    # No-vig probabilities are pre-computed at write time so analysis queries
+    # don't re-derive them. Spreads/totals are stored as JSON arrays of alt-line
+    # tuples to keep this table to one row per (orderbook snapshot, match/map).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pinnacle_snapshots (
+            id                     INTEGER PRIMARY KEY,
+            orderbook_snapshot_id  INTEGER,
+            market_id              TEXT,
+            pin_match_id           INTEGER NOT NULL,
+            pin_map_num            INTEGER NOT NULL,
+            timestamp              INTEGER NOT NULL,
+            is_live                INTEGER,
+            ml_home_implied        REAL,
+            ml_away_implied        REAL,
+            ml_draw_implied        REAL,
+            ml_home_novig          REAL,
+            ml_away_novig          REAL,
+            ml_draw_novig          REAL,
+            spreads_json           TEXT,
+            totals_json            TEXT,
+            pin_observed_at_ms     INTEGER,
+            FOREIGN KEY (orderbook_snapshot_id) REFERENCES orderbook_snapshots(id),
+            FOREIGN KEY (market_id) REFERENCES markets(market_id)
+        )
+    """)
+
     # Create indexes for faster queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_market ON price_history(market_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_timestamp ON price_history(timestamp)")
@@ -263,6 +309,10 @@ def init_database() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_open_interest_timestamp ON open_interest(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_id_map_game_id ON game_id_map(game_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_id_map_market_id ON game_id_map(market_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_orderbook ON pinnacle_snapshots(orderbook_snapshot_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_match ON pinnacle_snapshots(pin_match_id, pin_map_num, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_market ON pinnacle_snapshots(market_id, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_links_match ON pinnacle_match_links(pin_match_id, pin_map_num)")
 
     conn.commit()
 
@@ -295,6 +345,45 @@ def migrate_database() -> None:
     for col_name, col_type in migrations:
         if col_name not in existing_cols:
             cursor.execute(f"ALTER TABLE markets ADD COLUMN {col_name} {col_type}")
+
+    # Pinnacle integration tables — created here too so migrate-then-init covers
+    # already-deployed DBs that won't re-enter init_database()'s CREATE IF NOT EXISTS
+    # path until a fresh process start.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pinnacle_match_links (
+            market_id      TEXT PRIMARY KEY,
+            pin_match_id   INTEGER,
+            pin_map_num    INTEGER,
+            home_team      TEXT,
+            away_team      TEXT,
+            link_method    TEXT,
+            confidence     REAL,
+            linked_at      INTEGER,
+            FOREIGN KEY (market_id) REFERENCES markets(market_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pinnacle_snapshots (
+            id                     INTEGER PRIMARY KEY,
+            orderbook_snapshot_id  INTEGER,
+            market_id              TEXT,
+            pin_match_id           INTEGER NOT NULL,
+            pin_map_num            INTEGER NOT NULL,
+            timestamp              INTEGER NOT NULL,
+            is_live                INTEGER,
+            ml_home_implied        REAL,
+            ml_away_implied        REAL,
+            ml_draw_implied        REAL,
+            ml_home_novig          REAL,
+            ml_away_novig          REAL,
+            ml_draw_novig          REAL,
+            spreads_json           TEXT,
+            totals_json            TEXT,
+            pin_observed_at_ms     INTEGER,
+            FOREIGN KEY (orderbook_snapshot_id) REFERENCES orderbook_snapshots(id),
+            FOREIGN KEY (market_id) REFERENCES markets(market_id)
+        )
+    """)
 
     conn.commit()
 
@@ -410,8 +499,8 @@ def insert_orderbook_snapshot(
     mid_price: Optional[float],
     bid_depth: List[Dict[str, Any]],
     ask_depth: List[Dict[str, Any]],
-) -> None:
-    """Insert an orderbook snapshot record."""
+) -> Optional[int]:
+    """Insert an orderbook snapshot record. Returns the new row id."""
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -435,6 +524,7 @@ def insert_orderbook_snapshot(
     ))
 
     conn.commit()
+    return cursor.lastrowid
 
 
 def insert_final_price(
@@ -665,6 +755,86 @@ def compute_and_store_closing_lines(game_id: str, match_data: Dict[str, Any]) ->
     return inserted
 
 
+def upsert_pinnacle_link(
+    market_id: str,
+    pin_match_id: Optional[int],
+    pin_map_num: Optional[int],
+    home_team: Optional[str],
+    away_team: Optional[str],
+    link_method: str,
+    confidence: Optional[float],
+) -> None:
+    """Insert or replace a pinnacle match link for a polymarket market.
+
+    `link_method='unmatched'` is the sentinel used when fuzzy matching failed —
+    it stops the realtime collector from re-running the search every snapshot.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO pinnacle_match_links
+        (market_id, pin_match_id, pin_map_num, home_team, away_team,
+         link_method, confidence, linked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        market_id, pin_match_id, pin_map_num, home_team, away_team,
+        link_method, confidence, int(time.time()),
+    ))
+    conn.commit()
+
+
+def get_pinnacle_link(market_id: str) -> Optional[Dict[str, Any]]:
+    """Return the pinnacle link row for a market, or None if never attempted."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM pinnacle_match_links WHERE market_id = ?", (market_id,))
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def insert_pinnacle_snapshot(
+    orderbook_snapshot_id: Optional[int],
+    market_id: Optional[str],
+    pin_match_id: int,
+    pin_map_num: int,
+    timestamp: int,
+    is_live: Optional[bool],
+    ml_home_implied: Optional[float],
+    ml_away_implied: Optional[float],
+    ml_draw_implied: Optional[float],
+    ml_home_novig: Optional[float],
+    ml_away_novig: Optional[float],
+    ml_draw_novig: Optional[float],
+    spreads: Optional[List[Dict[str, Any]]],
+    totals: Optional[List[Dict[str, Any]]],
+    pin_observed_at_ms: Optional[int],
+) -> None:
+    """Insert a pinnacle odds snapshot, optionally linked to an orderbook row.
+
+    All probabilities are on the 0-1 scale (same as polymarket prices).
+    *_implied = 1/dec (carries the vig); *_novig = vig stripped via proportional method.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO pinnacle_snapshots
+        (orderbook_snapshot_id, market_id, pin_match_id, pin_map_num, timestamp,
+         is_live, ml_home_implied, ml_away_implied, ml_draw_implied,
+         ml_home_novig, ml_away_novig, ml_draw_novig,
+         spreads_json, totals_json, pin_observed_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        orderbook_snapshot_id, market_id, pin_match_id, pin_map_num, timestamp,
+        1 if is_live else (0 if is_live is False else None),
+        ml_home_implied, ml_away_implied, ml_draw_implied,
+        ml_home_novig, ml_away_novig, ml_draw_novig,
+        json.dumps(spreads) if spreads is not None else None,
+        json.dumps(totals) if totals is not None else None,
+        pin_observed_at_ms,
+    ))
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -708,6 +878,31 @@ def get_all_markets(game: Optional[str] = None) -> List[Dict[str, Any]]:
         markets.append(market)
 
     return markets
+
+
+def get_pinnacle_link_summary(game: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Return linked / unmatched / unattempted markets for the --pinnacle-status CLI.
+
+    Only returns markets where game='cs2' since pinnacle integration is CS2-only.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    target_game = game or "cs2"
+    cursor.execute("""
+        SELECT m.market_id, m.question, m.game_start_time,
+               l.pin_match_id, l.pin_map_num, l.home_team, l.away_team,
+               l.link_method, l.confidence
+        FROM markets m
+        LEFT JOIN pinnacle_match_links l ON m.market_id = l.market_id
+        WHERE m.game = ?
+        ORDER BY m.game_start_time DESC
+    """, (target_game,))
+    rows = [dict(r) for r in cursor.fetchall()]
+
+    linked = [r for r in rows if r["link_method"] in ("auto-fuzzy", "manual")]
+    unmatched = [r for r in rows if r["link_method"] == "unmatched"]
+    unattempted = [r for r in rows if r["link_method"] is None]
+    return {"linked": linked, "unmatched": unmatched, "unattempted": unattempted}
 
 
 def get_market_by_id(market_id: str) -> Optional[Dict[str, Any]]:

@@ -22,7 +22,11 @@ from src.historical_collector import (
 )
 from src.realtime_collector import run_realtime_collection
 from src.sports_collector import SportsCollector, run_sports_collection
-from src.config import DISCOVERY_INTERVAL, ORDERBOOK_POLL_INTERVAL, VALID_GAMES
+from src.config import (
+    DISCOVERY_INTERVAL, ORDERBOOK_POLL_INTERVAL, VALID_GAMES,
+    TRADING_ENABLED, SIGNAL_SCAN_INTERVAL, ORDER_CHECK_INTERVAL,
+    SPORTSBOOK_ENABLED,
+)
 from src.utils import logger
 
 
@@ -152,6 +156,48 @@ def cmd_sports_ws(args):
     return 0
 
 
+def cmd_verify_sportsbook(args):
+    """Verify BoltOdds esports coverage."""
+    from src.sportsbook.client import verify_esports_coverage, boltodds_get_games
+
+    print("\nVerifying BoltOdds esports coverage...\n")
+    result = verify_esports_coverage()
+
+    if "error" in result and result["error"]:
+        print(f"  Error: {result['error']}")
+        return 1
+
+    sports = result.get("sports", [])
+    print(f"  Available sports ({len(sports)}):")
+    for s in sorted(sports):
+        print(f"    - {s}")
+
+    print(f"\n  COD / Call of Duty: {'YES' if result.get('cod') else 'NO'}")
+    print(f"  CS2 / Counter-Strike: {'YES' if result.get('cs2') else 'NO'}")
+
+    # Try to fetch games for esports-like sport keys
+    for sport_key in sports:
+        s_lower = sport_key.lower()
+        if any(kw in s_lower for kw in ["esport", "cod", "cs2", "csgo", "counter"]):
+            print(f"\n  Fetching games for '{sport_key}'...")
+            games = boltodds_get_games(sport_key)
+            if games:
+                print(f"    Found {len(games)} games")
+                for g in games[:5]:
+                    if isinstance(g, dict):
+                        print(f"      {g.get('game', g.get('name', str(g)[:80]))}")
+                    else:
+                        print(f"      {str(g)[:80]}")
+            else:
+                print("    No games found")
+
+    if not result.get("cod") and not result.get("cs2"):
+        print("\n  WARNING: No esports coverage detected.")
+        print("  Consider alternatives: The Odds API, OddsJam, or manual Pinnacle entry.")
+
+    return 0
+
+
 def cmd_open_interest(args):
     """Collect open interest snapshots."""
     games = _resolve_games(args)
@@ -170,6 +216,43 @@ def cmd_open_interest(args):
     print(f"  - Snapshots collected: {total}")
 
     return 0
+
+
+async def trading_loop(games: list, shutdown_event: asyncio.Event):
+    """Periodically scan for signals and execute trades.
+
+    - Every SIGNAL_SCAN_INTERVAL: scan for signals and execute
+    - Every ORDER_CHECK_INTERVAL: check open order status
+    """
+    from src.trading.signals import scan_for_signals
+    from src.trading.executor import execute_signals, check_open_orders
+
+    last_order_check = time.time()
+
+    while not shutdown_event.is_set():
+        try:
+            # Scan for signals
+            signals = scan_for_signals(games)
+            if signals:
+                logger.info(f"Trading: {len(signals)} signals detected, executing...")
+                results = execute_signals(signals)
+                placed = sum(1 for r in results if r.success)
+                logger.info(f"Trading: {placed}/{len(results)} orders placed")
+
+            # Periodically check open orders
+            if time.time() - last_order_check >= ORDER_CHECK_INTERVAL:
+                check_open_orders()
+                last_order_check = time.time()
+
+        except Exception as e:
+            logger.error(f"Error in trading loop: {e}")
+
+        # Wait for next scan interval
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=SIGNAL_SCAN_INTERVAL)
+            break  # shutdown_event was set
+        except asyncio.TimeoutError:
+            pass  # Normal timeout — continue loop
 
 
 async def run_continuous_mode(args):
@@ -222,6 +305,33 @@ async def run_continuous_mode(args):
     # Start sports WebSocket collector
     sports = SportsCollector(games=games)
 
+    # Determine trading state early (needed by sportsbook setup)
+    enable_trading = getattr(args, 'trading', False) and TRADING_ENABLED
+
+    # Start BoltOdds sportsbook feed if enabled
+    boltodds_client = None
+    boltodds_task = None
+    if SPORTSBOOK_ENABLED:
+        from src.sportsbook.client import BoltOddsClient, SportsBookCache
+        sportsbook_cache = SportsBookCache()
+        boltodds_client = BoltOddsClient(sportsbook_cache)
+
+        # Wire the cache into the signal scanner
+        import src.trading.signals as _signals_mod
+        _signals_mod._sportsbook_cache = sportsbook_cache
+
+        # Set bankroll from balance if trading is active, else default
+        try:
+            if enable_trading:
+                from src.trading import client as _tc
+                bal = _tc.get_balance()
+                _signals_mod._sportsbook_bankroll = bal
+                logger.info(f"Sportsbook bankroll set to ${bal:.2f}")
+        except Exception:
+            pass
+
+        logger.info("Sportsbook EV engine enabled — starting BoltOdds feed")
+
     last_discovery_time = time.time()
 
     async def discovery_loop():
@@ -262,6 +372,15 @@ async def run_continuous_mode(args):
     discovery_task = asyncio.create_task(discovery_loop())
     sports_task = asyncio.create_task(sports.run())
 
+    if boltodds_client:
+        boltodds_task = asyncio.create_task(boltodds_client.run())
+
+    # Optionally start trading loop
+    trading_task = None
+    if enable_trading:
+        logger.info("Trading engine enabled — starting signal scanner")
+        trading_task = asyncio.create_task(trading_loop(games, shutdown_event))
+
     try:
         # Run the realtime collector (this blocks until stopped)
         await collector.run(markets if markets else None)
@@ -270,8 +389,14 @@ async def run_continuous_mode(args):
     finally:
         collector.stop()
         sports.stop()
+        if boltodds_client:
+            boltodds_client.stop()
         discovery_task.cancel()
         sports_task.cancel()
+        if boltodds_task:
+            boltodds_task.cancel()
+        if trading_task:
+            trading_task.cancel()
         try:
             await discovery_task
         except asyncio.CancelledError:
@@ -280,6 +405,16 @@ async def run_continuous_mode(args):
             await sports_task
         except asyncio.CancelledError:
             pass
+        if boltodds_task:
+            try:
+                await boltodds_task
+            except asyncio.CancelledError:
+                pass
+        if trading_task:
+            try:
+                await trading_task
+            except asyncio.CancelledError:
+                pass
 
     logger.info("Continuous mode stopped.")
 
@@ -290,6 +425,37 @@ def cmd_continuous(args):
         asyncio.run(run_continuous_mode(args))
     except KeyboardInterrupt:
         print("\nStopped by user")
+
+    return 0
+
+
+def cmd_trading(args):
+    """Run standalone trading engine (signal scan + execution only)."""
+    if not TRADING_ENABLED:
+        logger.error("Trading is disabled. Set TRADING_ENABLED=true environment variable.")
+        return 1
+
+    games = _resolve_games(args)
+    logger.info(f"Starting standalone trading engine for: {', '.join(g.upper() for g in games)}")
+    logger.info(f"  - Signal scan interval: {SIGNAL_SCAN_INTERVAL}s")
+    logger.info(f"  - Order check interval: {ORDER_CHECK_INTERVAL}s")
+    print("Press Ctrl+C to stop...")
+
+    shutdown_event = asyncio.Event()
+
+    async def _run():
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, shutdown_event.set)
+            except NotImplementedError:
+                pass
+        await trading_loop(games, shutdown_event)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        print("\nTrading engine stopped by user")
 
     return 0
 
@@ -314,6 +480,77 @@ def cmd_stats(args):
     print(f"  - Final price snapshots: {stats['final_price_snapshots']}")
     print(f"  - Open interest records: {stats['open_interest_records']}")
 
+    return 0
+
+
+def cmd_pinnacle_status(args):
+    """Show pinnacle link coverage across CS2 markets."""
+    from src.database import get_pinnacle_link_summary
+
+    summary = get_pinnacle_link_summary(game="cs2")
+    linked = summary["linked"]
+    unmatched = summary["unmatched"]
+    unattempted = summary["unattempted"]
+
+    print(f"\nPinnacle link summary (CS2 markets):")
+    print(f"  Linked:      {len(linked)}")
+    print(f"  Unmatched:   {len(unmatched)}  (auto-fuzzy gave up; use --link-pinnacle to override)")
+    print(f"  Unattempted: {len(unattempted)} (no pinnacle fetch yet — collector will try on next snapshot)")
+
+    if linked:
+        print("\nLinked markets:")
+        for r in linked[:20]:
+            print(
+                f"  [{r['link_method']:10s} {r['confidence']:.2f}] "
+                f"{(r['question'] or '')[:55]} -> "
+                f"{r['home_team']} vs {r['away_team']} (match_id={r['pin_match_id']}, map={r['pin_map_num']})"
+            )
+        if len(linked) > 20:
+            print(f"  ... +{len(linked) - 20} more")
+
+    if unmatched:
+        print("\nUnmatched markets (manual override candidates):")
+        for r in unmatched[:20]:
+            print(f"  market_id={r['market_id']}  q={(r['question'] or '')[:60]}")
+        if len(unmatched) > 20:
+            print(f"  ... +{len(unmatched) - 20} more")
+
+    return 0
+
+
+def cmd_link_pinnacle(args):
+    """Manually attach a polymarket market to a pinnacle match/map."""
+    from src.database import upsert_pinnacle_link
+    from src import pinnacle as pin
+
+    if not args.market_id or args.pin_match_id is None or args.pin_map_num is None:
+        logger.error("--link-pinnacle requires --market-id, --pin-match-id, and --pin-map-num")
+        return 1
+
+    # Look up the home/away from cs2odds for the audit trail
+    home_team = away_team = None
+    odds = pin.fetch_match_odds(args.pin_match_id)
+    if odds:
+        meta = odds.get("match") or {}
+        home_team = meta.get("home")
+        away_team = meta.get("away")
+    else:
+        logger.warning(f"cs2odds doesn't currently know match_id={args.pin_match_id}; saving link anyway")
+
+    upsert_pinnacle_link(
+        market_id=args.market_id,
+        pin_match_id=args.pin_match_id,
+        pin_map_num=args.pin_map_num,
+        home_team=home_team,
+        away_team=away_team,
+        link_method="manual",
+        confidence=1.0,
+    )
+    print(
+        f"Linked market_id={args.market_id} -> "
+        f"pin_match_id={args.pin_match_id} map={args.pin_map_num} "
+        f"({home_team} vs {away_team})"
+    )
     return 0
 
 
@@ -356,6 +593,8 @@ Examples:
   python main.py --sports-ws                 # Listen for match endings + snapshot prices
   python main.py --open-interest             # Collect open interest snapshots
   python main.py --continuous                # Tournament mode (all collectors)
+  python main.py --continuous --trading      # Tournament mode + automated trading
+  python main.py --trading --game cod        # Standalone trading engine
   python main.py --stats                     # Show database statistics
   python main.py --list --game cs2           # List stored CS2 markets
         """
@@ -423,6 +662,11 @@ Examples:
         help="Run discover + historical collection"
     )
     parser.add_argument(
+        "--trading",
+        action="store_true",
+        help="Enable automated trading (requires TRADING_ENABLED=true env var)"
+    )
+    parser.add_argument(
         "--include-closed",
         action="store_true",
         help="Include closed/resolved markets in discovery"
@@ -432,6 +676,24 @@ Examples:
         action="store_true",
         help="Enable orderbook polling during realtime collection"
     )
+    parser.add_argument(
+        "--verify-sportsbook",
+        action="store_true",
+        help="Check BoltOdds API for esports coverage (COD/CS2)"
+    )
+    parser.add_argument(
+        "--pinnacle-status",
+        action="store_true",
+        help="Show pinnacle link coverage across CS2 markets"
+    )
+    parser.add_argument(
+        "--link-pinnacle",
+        action="store_true",
+        help="Manually link a polymarket market to a pinnacle match (use with --market-id, --pin-match-id, --pin-map-num)"
+    )
+    parser.add_argument("--market-id", type=str, default=None)
+    parser.add_argument("--pin-match-id", type=int, default=None)
+    parser.add_argument("--pin-map-num", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -446,6 +708,8 @@ Examples:
         args.discover, args.historical, args.realtime, args.stats,
         args.list, args.all, args.orderbook, args.discover_tags,
         args.continuous, args.sports_ws, args.open_interest,
+        args.trading, args.verify_sportsbook,
+        args.pinnacle_status, args.link_pinnacle,
     ]
     if not any(commands):
         parser.print_help()
@@ -453,8 +717,14 @@ Examples:
 
     # Run requested commands (with clean shutdown of DB connection)
     try:
+        if args.verify_sportsbook:
+            return cmd_verify_sportsbook(args)
+
         if args.continuous:
             return cmd_continuous(args)
+
+        if args.trading and not args.continuous:
+            return cmd_trading(args)
 
         if args.all:
             cmd_discover(args)
@@ -487,6 +757,12 @@ Examples:
 
         if args.list:
             return cmd_list(args)
+
+        if args.pinnacle_status:
+            return cmd_pinnacle_status(args)
+
+        if args.link_pinnacle:
+            return cmd_link_pinnacle(args)
 
         return 0
     finally:

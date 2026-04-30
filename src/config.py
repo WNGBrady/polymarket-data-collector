@@ -234,3 +234,11 @@ DISCOVERY_INTERVAL = 1800  # 30 minutes between market discovery runs
 
 # Sports WebSocket settings
 MATCH_SNAPSHOT_DELAY = 2  # seconds to wait after match end before snapshotting
+
+# Pinnacle (cs2odds) integration. The cs2odds daemon runs as a separate systemd
+# service and exposes its in-memory state on this localhost port. If the API is
+# unreachable, the realtime collector logs and skips — no orderbook collection
+# is blocked on it.
+PINNACLE_API_URL = os.environ.get("PINNACLE_API_URL", "http://127.0.0.1:8765")
+PINNACLE_HTTP_TIMEOUT = float(os.environ.get("PINNACLE_HTTP_TIMEOUT", "0.5"))
+PINNACLE_FUZZY_THRESHOLD = float(os.environ.get("PINNACLE_FUZZY_THRESHOLD", "0.85"))
