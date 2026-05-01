@@ -168,9 +168,9 @@ def extract_snapshot_for_map(
         h_dec, a_dec = slot.get("home"), slot.get("away")
         h_nv, a_nv = novig_two_way(h_dec, a_dec)
         spreads.append({
-            "line": ln,
-            "home_implied": implied(h_dec), "away_implied": implied(a_dec),
-            "home_novig": h_nv, "away_novig": a_nv,
+            "line": -ln,
+            "home_implied": implied(a_dec), "away_implied": implied(h_dec),
+            "home_novig": a_nv, "away_novig": h_nv,
         })
 
     totals = []
@@ -185,14 +185,20 @@ def extract_snapshot_for_map(
         })
 
     match_meta = odds.get("match") or {}
+    # cs2odds labels team strings as home=event[1]/away=event[2] but the price
+    # arrays (moneyline[0], spread[3]) are anchored to a different team than the
+    # event[1] string for CS2 — empirically verified against Polymarket prices on
+    # 2026-05-01 G2 vs FaZe (PM mid aligns with Pinnacle's "away" no-vig within
+    # 8pp; "home" diverges 30-80pp). Swap here so ml_home_* reflects the team
+    # named in pinnacle_match_links.home_team. Spreads also flip the line sign.
     return {
         "pin_map_num": pin_map_num,
         "is_live": match_meta.get("feed") == "live",
-        "ml_home_implied": implied(ml_home_dec),
-        "ml_away_implied": implied(ml_away_dec),
+        "ml_home_implied": implied(ml_away_dec),
+        "ml_away_implied": implied(ml_home_dec),
         "ml_draw_implied": implied(ml_draw_dec),
-        "ml_home_novig": ml_h_nv,
-        "ml_away_novig": ml_a_nv,
+        "ml_home_novig": ml_a_nv,
+        "ml_away_novig": ml_h_nv,
         "ml_draw_novig": ml_d_nv,
         "spreads": spreads if spreads else None,
         "totals": totals if totals else None,
@@ -308,6 +314,10 @@ def fuzzy_match_market(
     Scoring: average of (best home-team match ratio, best away-team match ratio)
     across the candidate splits. Both teams must exceed the threshold for a hit.
 
+    Once the match starts, cs2odds emits both a 'matchup' (frozen pre-match) and
+    'live' (in-game) entry for the same teams — both score 1.0 here. Prefer the
+    live one so we capture in-game line movement instead of stale pre-match.
+
     Returns (match_dict, confidence) or None.
     """
     if not matches:
@@ -318,7 +328,7 @@ def fuzzy_match_market(
 
     cand_a, cand_b = candidates[0], candidates[1]
 
-    best: Optional[Tuple[Dict[str, Any], float]] = None
+    hits: List[Tuple[Dict[str, Any], float]] = []
     for m in matches:
         home = m.get("home") or ""
         away = m.get("away") or ""
@@ -328,10 +338,14 @@ def fuzzy_match_market(
         score_ab_min = min(_ratio(cand_a, home), _ratio(cand_b, away))
         score_ba_min = min(_ratio(cand_a, away), _ratio(cand_b, home))
         score = max(score_ab_min, score_ba_min)
-        if score >= threshold and (best is None or score > best[1]):
-            best = (m, score)
+        if score >= threshold:
+            hits.append((m, score))
 
-    return best
+    if not hits:
+        return None
+
+    hits.sort(key=lambda h: (1 if (h[0].get("feed") or "") == "live" else 0, h[1]), reverse=True)
+    return hits[0]
 
 
 def attempt_link_for_market(market: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]], Optional[float]]:

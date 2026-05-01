@@ -126,6 +126,8 @@ class RealtimeCollector:
         self.markets: List[Dict[str, Any]] = []
         self._orderbook_task: Optional[asyncio.Task] = None
         self._orderbook_fast_task: Optional[asyncio.Task] = None
+        self._pin_matches_cache: Optional[List[Dict[str, Any]]] = None
+        self._pin_matches_cache_ts: float = 0.0
 
     async def connect(self) -> bool:
         """Establish WebSocket connection."""
@@ -348,6 +350,8 @@ class RealtimeCollector:
         if pin_match_id is None:
             return
 
+        pin_match_id = self._maybe_promote_link_to_live(market_id, link, pin_match_id)
+
         odds = pinnacle.fetch_match_odds(pin_match_id)
         if odds is None:
             return
@@ -364,6 +368,55 @@ class RealtimeCollector:
             timestamp=timestamp,
             **snap,
         )
+
+    def _get_pin_matches_cached(self, ttl: float = 30.0) -> Optional[List[Dict[str, Any]]]:
+        """List of pinnacle matches with a short TTL — keeps the matchup→live promotion
+        cheap (one /matches call every 30s) when many markets are linked to the same event."""
+        now = time.time()
+        if self._pin_matches_cache is not None and (now - self._pin_matches_cache_ts) < ttl:
+            return self._pin_matches_cache
+        try:
+            self._pin_matches_cache = pinnacle.list_matches()
+            self._pin_matches_cache_ts = now
+        except Exception:
+            return self._pin_matches_cache  # stale is better than nothing
+        return self._pin_matches_cache
+
+    def _maybe_promote_link_to_live(
+        self, market_id: str, link: Dict[str, Any], pin_match_id: int
+    ) -> int:
+        """If the link points to a 'matchup' (frozen pre-match) feed and a 'live' child
+        exists, swap the link to the live match_id and persist. Returns the match_id to
+        actually fetch odds from for this snapshot."""
+        matches = self._get_pin_matches_cached()
+        if not matches:
+            return pin_match_id
+        cur = next((m for m in matches if m.get("match_id") == pin_match_id), None)
+        if cur is None or (cur.get("feed") or "") == "live":
+            return pin_match_id
+        live = next(
+            (m for m in matches
+             if m.get("parent_match_id") == pin_match_id and (m.get("feed") or "") == "live"),
+            None,
+        )
+        if live is None:
+            return pin_match_id
+        new_id = live.get("match_id")
+        if new_id is None:
+            return pin_match_id
+        upsert_pinnacle_link(
+            market_id=market_id,
+            pin_match_id=new_id,
+            pin_map_num=link.get("pin_map_num"),
+            home_team=live.get("home"),
+            away_team=live.get("away"),
+            link_method=link.get("link_method") or "auto-fuzzy",
+            confidence=link.get("confidence") or 1.0,
+        )
+        logger.info(
+            f"pinnacle: promoted market {market_id} {pin_match_id} (matchup) -> {new_id} (live)"
+        )
+        return new_id
 
     def _auto_link_market(self, market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """One-shot fuzzy-match attempt. Persists the result (or the 'unmatched'
