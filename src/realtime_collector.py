@@ -29,12 +29,35 @@ from . import pinnacle
 from .utils import logger, safe_float
 
 
-def is_tier1_cs2_market(market: Dict[str, Any]) -> bool:
-    """True for CS2 markets whose question mentions a tier-1 tournament keyword."""
-    if market.get("game") != "cs2":
-        return False
-    question = (market.get("question") or "").lower()
-    return any(kw in question for kw in TIER1_CS2_KEYWORDS)
+def compute_fast_tier_market_ids(markets: List[Dict[str, Any]]) -> Set[str]:
+    """Map sub-markets of tier-1 CS2 events go on the fast tier; the BO3 parent stays slow.
+
+    Tier-1 keywords typically only appear in the parent question (e.g. "G2 vs FaZe (BO3) -
+    BLAST Rivals Playoffs"), not in the per-map sub-markets, so we scan once for tier-1
+    event_ids, then promote any 'map'-flagged sub-market in those events.
+    """
+    tier1_events: Set[str] = set()
+    for m in markets:
+        if m.get("game") != "cs2":
+            continue
+        question = (m.get("question") or "").lower()
+        if any(kw in question for kw in TIER1_CS2_KEYWORDS):
+            ev = m.get("event_id")
+            if ev:
+                tier1_events.add(str(ev))
+
+    fast_ids: Set[str] = set()
+    for m in markets:
+        if m.get("game") != "cs2":
+            continue
+        ev = m.get("event_id")
+        if not ev or str(ev) not in tier1_events:
+            continue
+        if "map" in (m.get("question") or "").lower():
+            mid = m.get("market_id")
+            if mid:
+                fast_ids.add(str(mid))
+    return fast_ids
 
 
 class DeduplicationCache:
@@ -396,15 +419,16 @@ class RealtimeCollector:
             return None
 
     async def _poll_orderbooks(self) -> None:
-        """Default-tier orderbook polling. Skips tier-1 CS2 markets handled by the fast loop."""
+        """Default-tier orderbook polling. Skips fast-tier CS2 map markets handled by the fast loop."""
         logger.info(f"Starting orderbook polling (every {ORDERBOOK_POLL_INTERVAL}s)...")
 
         while self.running:
             try:
+                fast_ids = compute_fast_tier_market_ids(self.markets)
                 for market in self.markets:
                     if not self.running:
                         break
-                    if is_tier1_cs2_market(market):
+                    if str(market.get("market_id")) in fast_ids:
                         continue
                     self._snapshot_market(market)
                     await asyncio.sleep(0.1)
@@ -418,7 +442,7 @@ class RealtimeCollector:
                 await asyncio.sleep(5)
 
     async def _poll_orderbooks_fast(self) -> None:
-        """Fast-tier orderbook polling for tier-1 CS2 markets (IEM, ESL Pro League, BLAST, PGL).
+        """Fast-tier orderbook polling for CS2 map sub-markets in tier-1 events (IEM, ESL Pro League, BLAST, PGL).
 
         HTTP fetches run in parallel via a thread pool (semaphore-limited concurrency).
         DB inserts stay sequential on the event loop to avoid SQLite contention with the
@@ -426,7 +450,7 @@ class RealtimeCollector:
         """
         logger.info(
             f"Starting fast orderbook polling (every {FAST_ORDERBOOK_POLL_INTERVAL}s, "
-            f"concurrency={FAST_ORDERBOOK_CONCURRENCY}) for tier-1 CS2 markets..."
+            f"concurrency={FAST_ORDERBOOK_CONCURRENCY}) for tier-1 CS2 map markets..."
         )
 
         sem = asyncio.Semaphore(FAST_ORDERBOOK_CONCURRENCY)
@@ -440,7 +464,8 @@ class RealtimeCollector:
         while self.running:
             try:
                 round_start = time.time()
-                tier1 = [m for m in self.markets if is_tier1_cs2_market(m)]
+                fast_ids = compute_fast_tier_market_ids(self.markets)
+                tier1 = [m for m in self.markets if str(m.get("market_id")) in fast_ids]
 
                 if tier1:
                     results = await asyncio.gather(
