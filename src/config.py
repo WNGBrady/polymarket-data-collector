@@ -251,3 +251,42 @@ TRADING_ENABLED = os.environ.get("TRADING_ENABLED", "").lower() in {"1", "true",
 SPORTSBOOK_ENABLED = os.environ.get("SPORTSBOOK_ENABLED", "").lower() in {"1", "true", "yes"}
 SIGNAL_SCAN_INTERVAL = int(os.environ.get("SIGNAL_SCAN_INTERVAL", "30"))
 ORDER_CHECK_INTERVAL = int(os.environ.get("ORDER_CHECK_INTERVAL", "60"))
+
+# ---------------------------------------------------------------------------
+# Bot classification heuristics (Phase 3)
+# ---------------------------------------------------------------------------
+# Thresholds drive both the per-feature flag and the final bot_label assignment
+# in src/bot_classifier.py. Tune from here without touching code.
+BOT_HEURISTICS = {
+    "min_trades_for_classification": 10,
+    "inter_trade_cv_max": 0.30,        # CV below this → cadence is bot-like
+    "round_size_share_min": 0.60,      # >60% sizes are round → bot-like
+    "round_sizes": (5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000),
+    "round_size_tolerance": 0.5,       # accept e.g. 99.50–100.50 as "100"
+    "night_share_min": 0.25,           # >25% trades at 02:00–06:00 UTC → bot-like
+    "night_hours_utc": (2, 3, 4, 5),
+    "two_sided_ratio_min": 0.40,       # min(buy,sell)/max ≥ this → market maker
+    "two_sided_min_trades": 20,
+    "cross_market_burst_window_s": 5,
+    "cross_market_burst_distinct": 3,  # ≥3 distinct markets traded in 5s → bot-like
+    "markets_per_active_day_min": 20,  # touched ≥20 markets per active day → bot-like
+    "score_bot_threshold": 0.50,       # bot_score ≥ → label=bot
+    "score_likely_bot_threshold": 0.30,
+    # Per-feature contribution to bot_score (sum is normalised to [0, 1])
+    "weights": {
+        "inter_trade_cv": 0.25,
+        "round_size_share": 0.10,
+        "night_share": 0.10,
+        "cross_market_burst": 0.20,
+        "markets_per_day": 0.20,
+        "two_sided_ratio": 0.15,
+    },
+}
+
+# Phase 4: CS2 signal correlation
+CS2_SIGNAL_HEURISTICS = {
+    "pinnacle_lookback_window_s": 60,   # match a trade to the most recent Pinnacle snapshot within X s
+    "pinnacle_min_move_implied": 0.01,  # only count Pinnacle moves of |Δprob| ≥ 1%
+    "score_event_window_s": 10,         # trades landing within 10s of a final_prices event count as score reaction
+    "min_cs2_trades_for_signals": 5,
+}

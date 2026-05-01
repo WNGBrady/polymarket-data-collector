@@ -380,8 +380,24 @@ def process_trades(trades_response: Any) -> List[Dict[str, Any]]:
         price = safe_float(trade.get("price"))
         size = safe_float(trade.get("size") or trade.get("amount"))
         side = trade.get("side", "").upper()
-        outcome = trade.get("outcome") or trade.get("asset")
+        outcome = trade.get("outcome")
+        asset = trade.get("asset")
         trade_id = trade.get("id") or trade.get("tradeId") or f"{ts}_{price}_{size}"
+
+        # Wallet identity fields exposed by the Polymarket Data API trades endpoint.
+        proxy_wallet = trade.get("proxyWallet") or trade.get("proxy_wallet")
+        if isinstance(proxy_wallet, str):
+            proxy_wallet = proxy_wallet.lower() or None
+        name = trade.get("name") or None
+        pseudonym = trade.get("pseudonym") or None
+        tx_hash = trade.get("transactionHash") or trade.get("transaction_hash")
+        outcome_index = trade.get("outcomeIndex")
+        if outcome_index is None:
+            outcome_index = trade.get("outcome_index")
+        try:
+            outcome_index = int(outcome_index) if outcome_index is not None else None
+        except (TypeError, ValueError):
+            outcome_index = None
 
         if ts and price:
             trades.append({
@@ -390,7 +406,13 @@ def process_trades(trades_response: Any) -> List[Dict[str, Any]]:
                 "price": price,
                 "size": size,
                 "side": side,
-                "outcome": outcome,
+                "outcome": outcome or asset,
+                "proxy_wallet": proxy_wallet,
+                "name": name,
+                "pseudonym": pseudonym,
+                "transaction_hash": tx_hash,
+                "outcome_index": outcome_index,
+                "asset": asset,
             })
 
     return trades

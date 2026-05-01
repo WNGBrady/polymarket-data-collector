@@ -198,6 +198,99 @@ def cmd_verify_sportsbook(args):
     return 0
 
 
+def cmd_backfill_trades(args):
+    """Re-fetch trade history to populate wallet identity columns.
+
+    Trades are deduped on trade_id; the upsert in insert_trades() fills
+    NULL wallet/pseudonym/transaction_hash columns without disturbing the
+    rest of the row. Use --since to skip markets that started before a date.
+    """
+    from src.historical_collector import collect_trades_for_market
+    from datetime import datetime, timezone
+
+    games = _resolve_games(args)
+    markets = []
+    for g in games:
+        markets.extend(list_stored_markets(game=g))
+
+    if not markets:
+        logger.error("No markets found in database. Run --discover first.")
+        return 1
+
+    since_str = getattr(args, "since", None)
+    since_ts = None
+    if since_str:
+        try:
+            since_ts = int(datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            logger.error(f"--since must be YYYY-MM-DD, got: {since_str}")
+            return 1
+
+    def _market_after_cutoff(m):
+        if since_ts is None:
+            return True
+        gst = m.get("game_start_time")
+        if not gst:
+            return True  # unknown start — include to be safe
+        try:
+            ts = int(datetime.fromisoformat(gst.replace("Z", "+00:00")).timestamp())
+            return ts >= since_ts
+        except (ValueError, AttributeError):
+            return True
+
+    targets = [m for m in markets if _market_after_cutoff(m)]
+    logger.info(
+        f"Backfilling trades for {len(targets)}/{len(markets)} markets "
+        f"(games={games}, since={since_str or 'all-time'})"
+    )
+
+    total = 0
+    for i, market in enumerate(targets):
+        question = (market.get("question") or "")[:50]
+        logger.info(f"Backfill {i + 1}/{len(targets)}: {question}...")
+        total += collect_trades_for_market(market)
+        time.sleep(0.2)
+
+    print(f"\nBackfill complete: {total} trade rows touched.")
+    return 0
+
+
+def cmd_recompute_wallets(args):
+    """Aggregate trades into the wallets table, classify bots, and compute
+    CS2-specific signals (Pinnacle following, score reaction, etc.).
+
+    Idempotent: re-runs overwrite per-wallet aggregates and labels but never
+    touch trades. --since limits which trades feed the aggregation; --game
+    restricts aggregation to a single game.
+    """
+    from src.wallet_aggregator import recompute_wallets
+    from src.bot_classifier import classify_all_wallets
+    from src.cs2_signal_analyzer import compute_cs2_signals
+    from datetime import datetime, timezone
+
+    games = _resolve_games(args)
+    game_filter = games[0] if len(games) == 1 else None
+
+    since_str = getattr(args, "since", None)
+    since_ts = None
+    if since_str:
+        try:
+            since_ts = int(datetime.strptime(since_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            logger.error(f"--since must be YYYY-MM-DD, got: {since_str}")
+            return 1
+
+    n_walls = recompute_wallets(game=game_filter, since_ts=since_ts)
+    n_classed = classify_all_wallets()
+    cs2_counts = compute_cs2_signals()
+
+    print(f"\nRecompute complete:")
+    print(f"  - Wallets aggregated: {n_walls}")
+    print(f"  - Wallets classified: {n_classed}")
+    print(f"  - CS2 signals: {cs2_counts}")
+    return 0
+
+
 def cmd_open_interest(args):
     """Collect open interest snapshots."""
     games = _resolve_games(args)
@@ -597,6 +690,10 @@ Examples:
   python main.py --trading --game cod        # Standalone trading engine
   python main.py --stats                     # Show database statistics
   python main.py --list --game cs2           # List stored CS2 markets
+  python main.py --backfill-trades --game cs2 --since 2025-09-01
+                                             # Re-pull CS2 trades to fill wallet columns
+  python main.py --recompute-wallets --game cs2
+                                             # Aggregate + classify CS2 wallets, refresh signals
         """
     )
 
@@ -635,6 +732,22 @@ Examples:
         "--open-interest",
         action="store_true",
         help="Collect open interest snapshots"
+    )
+    parser.add_argument(
+        "--backfill-trades",
+        action="store_true",
+        help="Re-fetch trades to populate wallet identity columns (use with --game and --since)"
+    )
+    parser.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        help="YYYY-MM-DD cutoff for --backfill-trades / --recompute-wallets (skip markets that started earlier)"
+    )
+    parser.add_argument(
+        "--recompute-wallets",
+        action="store_true",
+        help="Aggregate trades into the wallets table and run bot classification + CS2 signal correlation"
     )
     parser.add_argument(
         "--discover-tags",
@@ -710,6 +823,7 @@ Examples:
         args.continuous, args.sports_ws, args.open_interest,
         args.trading, args.verify_sportsbook,
         args.pinnacle_status, args.link_pinnacle,
+        args.backfill_trades, args.recompute_wallets,
     ]
     if not any(commands):
         parser.print_help()
@@ -751,6 +865,12 @@ Examples:
 
         if args.open_interest:
             return cmd_open_interest(args)
+
+        if args.backfill_trades:
+            return cmd_backfill_trades(args)
+
+        if args.recompute_wallets:
+            return cmd_recompute_wallets(args)
 
         if args.stats:
             return cmd_stats(args)

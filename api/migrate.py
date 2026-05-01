@@ -235,11 +235,86 @@ def migrate(db_path: str | None = None):
     conn.commit()
     print("closing_lines table ready.")
 
-    # 3. Backfill game_start_time from Gamma API for markets missing it
+    # 3. Add wallet identity columns to trades table for bot tracking
+    cursor.execute("PRAGMA table_info(trades)")
+    trade_cols = {row["name"] for row in cursor.fetchall()}
+    trade_migrations = [
+        ("proxy_wallet", "TEXT"),
+        ("name", "TEXT"),
+        ("pseudonym", "TEXT"),
+        ("transaction_hash", "TEXT"),
+        ("outcome_index", "INTEGER"),
+        ("asset", "TEXT"),
+    ]
+    added = 0
+    for col_name, col_type in trade_migrations:
+        if col_name not in trade_cols:
+            cursor.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+            added += 1
+    if added:
+        print(f"Added {added} wallet identity column(s) to trades.")
+    else:
+        print("trades table already has wallet identity columns.")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_proxy_wallet ON trades(proxy_wallet)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_proxy_wallet_ts ON trades(proxy_wallet, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_proxy_wallet ON trades(market_id, proxy_wallet)")
+    conn.commit()
+
+    # 4. Wallet aggregation table (Phase 2 - bot tracking)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            proxy_wallet         TEXT PRIMARY KEY,
+            pseudonym            TEXT,
+            name                 TEXT,
+            first_seen_ts        INTEGER,
+            last_seen_ts         INTEGER,
+            total_trades         INTEGER,
+            total_volume_usd     REAL,
+            distinct_markets     INTEGER,
+            distinct_games       INTEGER,
+            games_json           TEXT,
+            buy_count            INTEGER,
+            sell_count           INTEGER,
+            median_trade_size    REAL,
+            trade_size_cv        REAL,
+            median_inter_trade_s REAL,
+            inter_trade_cv       REAL,
+            active_hours         INTEGER,
+            active_days_per_week REAL,
+            round_size_share     REAL,
+            night_share          REAL,
+            cross_market_burst   INTEGER,
+            markets_per_day      REAL,
+            two_sided_ratio      REAL,
+            bot_score            REAL,
+            bot_label            TEXT,
+            last_recomputed_ts   INTEGER
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_bot_label ON wallets(bot_label)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_volume ON wallets(total_volume_usd DESC)")
+
+    # 5. CS2 wallet signal correlation table (Phase 4)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cs2_wallet_signals (
+            proxy_wallet     TEXT,
+            signal_name      TEXT,
+            signal_value     REAL,
+            n_observations   INTEGER,
+            computed_at_ts   INTEGER,
+            PRIMARY KEY (proxy_wallet, signal_name)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_signals_name ON cs2_wallet_signals(signal_name)")
+    conn.commit()
+    print("wallets + cs2_wallet_signals tables ready.")
+
+    # 6. Backfill game_start_time from Gamma API for markets missing it
     print("Backfilling game_start_time...")
     _backfill_game_start_times(conn)
 
-    # 4. Backfill closing_lines from existing trade + final_prices data
+    # 7. Backfill closing_lines from existing trade + final_prices data
     print("Backfilling closing lines from trade data...")
     _backfill_closing_lines(conn)
 

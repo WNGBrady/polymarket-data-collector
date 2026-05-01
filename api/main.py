@@ -21,6 +21,10 @@ from .routes import (
     closing_lines,
     pre_match,
     collection_health,
+    bot_overview,
+    wallet_profile,
+    cs2_bot_signals,
+    bot_leaderboard,
 )
 
 _start_time = time.monotonic()
@@ -54,6 +58,10 @@ app.include_router(spread_analysis.router, prefix="/api")
 app.include_router(closing_lines.router, prefix="/api")
 app.include_router(pre_match.router, prefix="/api")
 app.include_router(collection_health.router, prefix="/api")
+app.include_router(bot_overview.router, prefix="/api")
+app.include_router(wallet_profile.router, prefix="/api")
+app.include_router(cs2_bot_signals.router, prefix="/api")
+app.include_router(bot_leaderboard.router, prefix="/api")
 
 
 @app.get("/api/health")
