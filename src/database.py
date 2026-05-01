@@ -163,6 +163,12 @@ def init_database() -> None:
             size REAL,
             side TEXT,
             outcome TEXT,
+            proxy_wallet TEXT,
+            name TEXT,
+            pseudonym TEXT,
+            transaction_hash TEXT,
+            outcome_index INTEGER,
+            asset TEXT,
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         )
     """)
@@ -291,11 +297,58 @@ def init_database() -> None:
         )
     """)
 
+    # Wallet aggregation table (bot tracking)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            proxy_wallet         TEXT PRIMARY KEY,
+            pseudonym            TEXT,
+            name                 TEXT,
+            first_seen_ts        INTEGER,
+            last_seen_ts         INTEGER,
+            total_trades         INTEGER,
+            total_volume_usd     REAL,
+            distinct_markets     INTEGER,
+            distinct_games       INTEGER,
+            games_json           TEXT,
+            buy_count            INTEGER,
+            sell_count           INTEGER,
+            median_trade_size    REAL,
+            trade_size_cv        REAL,
+            median_inter_trade_s REAL,
+            inter_trade_cv       REAL,
+            active_hours         INTEGER,
+            active_days_per_week REAL,
+            round_size_share     REAL,
+            night_share          REAL,
+            cross_market_burst   INTEGER,
+            markets_per_day      REAL,
+            two_sided_ratio      REAL,
+            bot_score            REAL,
+            bot_label            TEXT,
+            last_recomputed_ts   INTEGER
+        )
+    """)
+
+    # CS2 wallet signal correlation table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cs2_wallet_signals (
+            proxy_wallet     TEXT,
+            signal_name      TEXT,
+            signal_value     REAL,
+            n_observations   INTEGER,
+            computed_at_ts   INTEGER,
+            PRIMARY KEY (proxy_wallet, signal_name)
+        )
+    """)
+
     # Create indexes for faster queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_market ON price_history(market_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_timestamp ON price_history(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_proxy_wallet ON trades(proxy_wallet)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_proxy_wallet_ts ON trades(proxy_wallet, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_proxy_wallet ON trades(market_id, proxy_wallet)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_realtime_market ON realtime_prices(market_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_realtime_timestamp ON realtime_prices(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_orderbook_market ON orderbook_snapshots(market_id)")
@@ -313,6 +366,9 @@ def init_database() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_match ON pinnacle_snapshots(pin_match_id, pin_map_num, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_market ON pinnacle_snapshots(market_id, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_links_match ON pinnacle_match_links(pin_match_id, pin_map_num)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_bot_label ON wallets(bot_label)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_volume ON wallets(total_volume_usd DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_signals_name ON cs2_wallet_signals(signal_name)")
 
     conn.commit()
 
@@ -345,6 +401,76 @@ def migrate_database() -> None:
     for col_name, col_type in migrations:
         if col_name not in existing_cols:
             cursor.execute(f"ALTER TABLE markets ADD COLUMN {col_name} {col_type}")
+
+    # Trades table: add wallet identity columns if missing
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trades'")
+    if cursor.fetchone():
+        cursor.execute("PRAGMA table_info(trades)")
+        trade_cols = {row["name"] for row in cursor.fetchall()}
+
+        trade_migrations = [
+            ("proxy_wallet", "TEXT"),
+            ("name", "TEXT"),
+            ("pseudonym", "TEXT"),
+            ("transaction_hash", "TEXT"),
+            ("outcome_index", "INTEGER"),
+            ("asset", "TEXT"),
+        ]
+        for col_name, col_type in trade_migrations:
+            if col_name not in trade_cols:
+                cursor.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+
+        # Indexes for wallet lookups
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_proxy_wallet ON trades(proxy_wallet)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_proxy_wallet_ts ON trades(proxy_wallet, timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_proxy_wallet ON trades(market_id, proxy_wallet)")
+
+    # Wallet aggregation table (Phase 2)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            proxy_wallet         TEXT PRIMARY KEY,
+            pseudonym            TEXT,
+            name                 TEXT,
+            first_seen_ts        INTEGER,
+            last_seen_ts         INTEGER,
+            total_trades         INTEGER,
+            total_volume_usd     REAL,
+            distinct_markets     INTEGER,
+            distinct_games       INTEGER,
+            games_json           TEXT,
+            buy_count            INTEGER,
+            sell_count           INTEGER,
+            median_trade_size    REAL,
+            trade_size_cv        REAL,
+            median_inter_trade_s REAL,
+            inter_trade_cv       REAL,
+            active_hours         INTEGER,
+            active_days_per_week REAL,
+            round_size_share     REAL,
+            night_share          REAL,
+            cross_market_burst   INTEGER,
+            markets_per_day      REAL,
+            two_sided_ratio      REAL,
+            bot_score            REAL,
+            bot_label            TEXT,
+            last_recomputed_ts   INTEGER
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_bot_label ON wallets(bot_label)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_volume ON wallets(total_volume_usd DESC)")
+
+    # CS2 wallet signal correlation table (Phase 4)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cs2_wallet_signals (
+            proxy_wallet     TEXT,
+            signal_name      TEXT,
+            signal_value     REAL,
+            n_observations   INTEGER,
+            computed_at_ts   INTEGER,
+            PRIMARY KEY (proxy_wallet, signal_name)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_signals_name ON cs2_wallet_signals(signal_name)")
 
     # Pinnacle integration tables — created here too so migrate-then-init covers
     # already-deployed DBs that won't re-enter init_database()'s CREATE IF NOT EXISTS
@@ -444,7 +570,11 @@ def insert_price_history(market_id: str, prices: List[Dict[str, Any]]) -> int:
 
 
 def insert_trades(market_id: str, trades: List[Dict[str, Any]]) -> int:
-    """Insert trade records. Returns count of new records inserted."""
+    """Insert trade records. Returns count of new records inserted.
+
+    On trade_id conflict, fills any wallet-identity columns that are still NULL
+    so existing rows get backfilled without overwriting other fields.
+    """
     if not trades:
         return 0
 
@@ -455,8 +585,18 @@ def insert_trades(market_id: str, trades: List[Dict[str, Any]]) -> int:
     for trade in trades:
         try:
             cursor.execute("""
-                INSERT INTO trades (market_id, trade_id, timestamp, price, size, side, outcome)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (
+                    market_id, trade_id, timestamp, price, size, side, outcome,
+                    proxy_wallet, name, pseudonym, transaction_hash, outcome_index, asset
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_id) DO UPDATE SET
+                    proxy_wallet     = COALESCE(trades.proxy_wallet, excluded.proxy_wallet),
+                    name             = COALESCE(trades.name, excluded.name),
+                    pseudonym        = COALESCE(trades.pseudonym, excluded.pseudonym),
+                    transaction_hash = COALESCE(trades.transaction_hash, excluded.transaction_hash),
+                    outcome_index    = COALESCE(trades.outcome_index, excluded.outcome_index),
+                    asset            = COALESCE(trades.asset, excluded.asset)
             """, (
                 market_id,
                 trade.get("trade_id"),
@@ -465,8 +605,15 @@ def insert_trades(market_id: str, trades: List[Dict[str, Any]]) -> int:
                 trade.get("size"),
                 trade.get("side"),
                 trade.get("outcome"),
+                trade.get("proxy_wallet"),
+                trade.get("name"),
+                trade.get("pseudonym"),
+                trade.get("transaction_hash"),
+                trade.get("outcome_index"),
+                trade.get("asset"),
             ))
-            inserted += 1
+            if cursor.rowcount:
+                inserted += 1
         except sqlite3.IntegrityError:
             pass
 

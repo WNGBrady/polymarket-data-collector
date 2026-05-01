@@ -202,6 +202,21 @@ def load_dataframes(db_path: Path) -> Dict[str, pd.DataFrame]:
         row = pd.read_sql_query(f"SELECT COUNT(*) as cnt FROM {table}", conn)
         counts[table] = int(row["cnt"].iloc[0])
 
+    # Wallets + CS2 signals — optional, present only after the bot-tracking
+    # migration. Empty DataFrames keep downstream report code branchless.
+    def _exists(table: str) -> bool:
+        row = pd.read_sql_query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            conn, params=(table,)
+        )
+        return len(row) > 0
+
+    wallets_df = pd.read_sql_query("SELECT * FROM wallets", conn) if _exists("wallets") else pd.DataFrame()
+    cs2_signals_df = (
+        pd.read_sql_query("SELECT * FROM cs2_wallet_signals", conn)
+        if _exists("cs2_wallet_signals") else pd.DataFrame()
+    )
+
     conn.close()
 
     return {
@@ -210,6 +225,8 @@ def load_dataframes(db_path: Path) -> Dict[str, pd.DataFrame]:
         "orderbook": orderbook_df,
         "final_prices": final_prices_df,
         "realtime": realtime_df,
+        "wallets": wallets_df,
+        "cs2_signals": cs2_signals_df,
         "counts": counts,
     }
 
@@ -915,6 +932,85 @@ def chart_closing_lines(closing_lines_df: pd.DataFrame) -> Optional[str]:
     return _save_chart(fig, "closing_lines_cs2")
 
 
+def chart_cs2_bot_volume_split(trades_df: pd.DataFrame, wallets_df: pd.DataFrame) -> Optional[str]:
+    """Stacked bar: CS2 volume per bot_label bucket."""
+    if wallets_df is None or len(wallets_df) == 0:
+        return None
+    cs2 = trades_df[trades_df["game"] == "cs2"].copy()
+    if len(cs2) == 0:
+        return None
+
+    label_map = wallets_df.set_index("proxy_wallet")["bot_label"].to_dict()
+    cs2["bot_label"] = cs2["proxy_wallet"].map(label_map).fillna("unknown")
+
+    by_label = cs2.groupby("bot_label").agg(volume=("size", "sum"), trades=("id", "count")).reset_index()
+    by_label = by_label.sort_values("volume", ascending=False)
+    if by_label["volume"].sum() == 0:
+        return None
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    palette = {
+        "bot": ACCENT2,
+        "likely_bot": "#e07a3a",
+        "market_maker": "#a45ae0",
+        "human": ACCENT,
+        "unknown": "#666",
+    }
+    colors_list = [palette.get(lab, "#888") for lab in by_label["bot_label"]]
+
+    ax1.bar(by_label["bot_label"], by_label["volume"], color=colors_list, edgecolor="#0e1117")
+    ax1.set_title("CS2 Volume by Wallet Class", fontweight="bold")
+    ax1.set_ylabel("Volume ($)")
+    for i, v in enumerate(by_label["volume"]):
+        ax1.text(i, v, format_volume(v), ha="center", va="bottom", fontsize=8, color="#ddd")
+
+    ax2.bar(by_label["bot_label"], by_label["trades"], color=colors_list, edgecolor="#0e1117")
+    ax2.set_title("CS2 Trades by Wallet Class", fontweight="bold")
+    ax2.set_ylabel("Trades")
+    for i, v in enumerate(by_label["trades"]):
+        ax2.text(i, v, format_number(v), ha="center", va="bottom", fontsize=8, color="#ddd")
+
+    for ax in (ax1, ax2):
+        ax.tick_params(axis="x", rotation=20, labelsize=8)
+        ax.grid(True, axis="y", alpha=0.3)
+
+    return _save_chart(fig, "cs2_bot_volume_split")
+
+
+def chart_cs2_inter_trade_cv(wallets_df: pd.DataFrame, trades_df: pd.DataFrame) -> Optional[str]:
+    """Histogram of inter-trade CV per wallet, coloured by bot_label.
+
+    Restricts to wallets that have any CS2 activity. Lower CV = more bot-like
+    cadence, so the human bucket should peak right and the bot bucket left.
+    """
+    if wallets_df is None or len(wallets_df) == 0:
+        return None
+    cs2_wallets = trades_df[trades_df["game"] == "cs2"]["proxy_wallet"].dropna().unique()
+    if len(cs2_wallets) == 0:
+        return None
+    df = wallets_df[wallets_df["proxy_wallet"].isin(cs2_wallets)].copy()
+    df = df[df["inter_trade_cv"].notna() & (df["total_trades"] >= 10)]
+    if len(df) == 0:
+        return None
+
+    labels = ["bot", "likely_bot", "market_maker", "human"]
+    palette = {"bot": ACCENT2, "likely_bot": "#e07a3a", "market_maker": "#a45ae0", "human": ACCENT}
+    fig, ax = plt.subplots(figsize=(9, 4))
+    bins = np.linspace(0, max(2.0, df["inter_trade_cv"].quantile(0.95)), 30)
+    for lab in labels:
+        sub = df[df["bot_label"] == lab]
+        if len(sub) == 0:
+            continue
+        ax.hist(sub["inter_trade_cv"], bins=bins, color=palette[lab], alpha=0.65,
+                label=f"{lab} (n={len(sub)})", edgecolor="#0e1117")
+    ax.set_xlabel("Inter-trade interval CV (lower = more regular)")
+    ax.set_ylabel("Wallet count")
+    ax.set_title("CS2 Wallet Cadence Regularity by Bot Label", fontweight="bold")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(fontsize=8, facecolor="#1a1a2e", edgecolor="#333")
+    return _save_chart(fig, "cs2_inter_trade_cv")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PDF BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1295,6 +1391,72 @@ def build_pdf(charts: Dict[str, Optional[str]], data: Dict, meta: Dict,
         story.append(Paragraph("No CS2 trade data available in this dataset.", styles["Body"]))
         story.append(PageBreak())
 
+    # ── CS2 Bot Activity ───────────────────────────────────────────────
+    wallets_df = data.get("wallets")
+    if wallets_df is not None and len(wallets_df) > 0:
+        story.append(Paragraph("3.X CS2 Bot Activity", styles["H2"]))
+        story.append(Paragraph(
+            "Per-trade wallet identities (proxyWallet) are joined to the wallets aggregation "
+            "table to classify each address. Labels: <b>bot</b> (≥3 bot-like signals), "
+            "<b>likely_bot</b> (cadence/round-size suggests automation), "
+            "<b>market_maker</b> (two-sided trader on the same market), <b>human</b> (low signal "
+            "score), <b>unknown</b> (pre-migration trades without an attached wallet).",
+            styles["Body"],
+        ))
+
+        cs2_trades = trades_df[trades_df["game"] == "cs2"]
+        cs2_wallets_present = wallets_df[wallets_df["proxy_wallet"].isin(
+            cs2_trades["proxy_wallet"].dropna().unique()
+        )]
+
+        # Top 10 CS2 wallets by volume, attached to label + signals
+        cs2_with_label = cs2_trades.merge(
+            wallets_df[["proxy_wallet", "bot_label", "bot_score", "pseudonym"]],
+            on="proxy_wallet", how="left",
+        )
+        top = (
+            cs2_with_label.dropna(subset=["proxy_wallet"])
+            .groupby(["proxy_wallet", "bot_label", "pseudonym"])
+            .agg(volume=("size", "sum"), trades=("id", "count"),
+                 markets=("market_id", "nunique"))
+            .reset_index()
+            .sort_values("volume", ascending=False)
+            .head(10)
+        )
+
+        if len(top) > 0:
+            top_rows = [["Wallet", "Pseudonym", "Label", "Volume", "Trades", "Markets"]]
+            for _, r in top.iterrows():
+                w = r["proxy_wallet"] or ""
+                top_rows.append([
+                    f"{w[:8]}…{w[-4:]}" if len(w) >= 12 else w,
+                    (r.get("pseudonym") or "—")[:18],
+                    r.get("bot_label") or "unknown",
+                    format_volume(r["volume"]),
+                    format_number(r["trades"]),
+                    format_number(r["markets"]),
+                ])
+            t_top_bots = Table(top_rows, colWidths=[1.4 * inch, 1.3 * inch, 1.0 * inch,
+                                                     1.0 * inch, 0.7 * inch, 0.7 * inch])
+            t_top_bots.setStyle(_table_style())
+            story.append(t_top_bots)
+            story.append(Spacer(1, 0.15 * inch))
+
+        if charts.get("cs2_bot_volume_split"):
+            story.append(Image(charts["cs2_bot_volume_split"], width=6.5 * inch, height=2.7 * inch))
+            story.append(Paragraph(
+                "CS2 volume and trade count split across bot/human classes.",
+                styles["Caption"]))
+
+        if charts.get("cs2_inter_trade_cv"):
+            story.append(Image(charts["cs2_inter_trade_cv"], width=6.5 * inch, height=2.7 * inch))
+            story.append(Paragraph(
+                "Distribution of inter-trade interval coefficient of variation. "
+                "Lower CV indicates more regular (machine-like) cadence.",
+                styles["Caption"]))
+
+        story.append(PageBreak())
+
     # ── Liquidity Analysis ─────────────────────────────────────────────
     story.append(Paragraph("4. Liquidity Analysis", styles["H1"]))
     story.append(Paragraph(
@@ -1496,6 +1658,10 @@ def main():
 
     # CS2 closing lines chart
     charts["closing_lines_cs2"] = chart_closing_lines(closing_lines)
+
+    # CS2 bot activity charts (require the wallets table populated)
+    charts["cs2_bot_volume_split"] = chart_cs2_bot_volume_split(trades_df, data.get("wallets"))
+    charts["cs2_inter_trade_cv"] = chart_cs2_inter_trade_cv(data.get("wallets"), trades_df)
 
     generated = [k for k, v in charts.items() if v]
     skipped = [k for k, v in charts.items() if v is None]
