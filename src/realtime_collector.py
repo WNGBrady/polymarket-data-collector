@@ -29,6 +29,15 @@ from . import pinnacle
 from .utils import logger, safe_float
 
 
+# How long to leave an `unmatched` link before re-attempting. cs2odds publishes
+# matches as Pinnacle's window opens (often 24-48h pre-match), so a market created
+# earlier may become matchable later. Without this TTL the linker would never retry.
+UNMATCHED_RETRY_TTL_S = 4 * 3600
+# Methods accepted by the snapshot writer — anything else (`unmatched`, `outright`,
+# `pinnacle-down`) means we have no Pinnacle counterpart for this market.
+LINK_METHODS_FOR_SNAPSHOT = ("auto-fuzzy", "manual", "event-inherited")
+
+
 def compute_fast_tier_market_ids(markets: List[Dict[str, Any]]) -> Set[str]:
     """Map sub-markets of tier-1 CS2 events go on the fast tier; the BO3 parent stays slow.
 
@@ -126,8 +135,9 @@ class RealtimeCollector:
         self.markets: List[Dict[str, Any]] = []
         self._orderbook_task: Optional[asyncio.Task] = None
         self._orderbook_fast_task: Optional[asyncio.Task] = None
-        self._pin_matches_cache: Optional[List[Dict[str, Any]]] = None
-        self._pin_matches_cache_ts: float = 0.0
+        # Per-bookmaker /matches cache: {bookmaker: (matches, timestamp)}.
+        # Keyed by book because matchup→live promotion fans out per book.
+        self._pin_matches_caches: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
 
     async def connect(self) -> bool:
         """Establish WebSocket connection."""
@@ -143,6 +153,47 @@ class RealtimeCollector:
         except Exception as e:
             logger.error(f"WebSocket connection failed: {e}")
             return False
+
+    async def add_markets(self, new_markets: List[Dict[str, Any]]) -> int:
+        """Append newly-discovered markets to the polling list and (if connected)
+        subscribe to their token streams.
+
+        Without this, new markets found by the continuous-mode discovery loop
+        sit in the database but never get polled — the realtime collector took
+        its market snapshot at startup and self.markets is otherwise immutable
+        for the lifetime of the run.
+
+        Returns the count of markets actually added (deduped against self.markets
+        by market_id).
+        """
+        if not new_markets:
+            return 0
+
+        existing_ids = {m.get("market_id") for m in self.markets}
+        additions = [m for m in new_markets if m.get("market_id") not in existing_ids]
+        if not additions:
+            return 0
+
+        # Build a new list rather than mutating in place so the polling loops'
+        # in-flight iterations finish against the old reference and pick up the
+        # additions on the next round.
+        self.markets = self.markets + additions
+
+        if self.websocket is not None:
+            new_token_ids: List[str] = []
+            for m in additions:
+                for k in ("clob_token_id_yes", "clob_token_id_no"):
+                    tok = m.get(k)
+                    if tok and tok not in self.subscribed_markets:
+                        new_token_ids.append(tok)
+            if new_token_ids:
+                try:
+                    await self.subscribe(new_token_ids)
+                except Exception as e:
+                    logger.warning(f"add_markets: WS resubscribe failed ({e}); polling will still pick them up")
+
+        logger.info(f"realtime collector: picked up {len(additions)} new markets via discovery")
+        return len(additions)
 
     async def subscribe(self, token_ids: List[str]) -> None:
         """Subscribe to price updates for given token IDs."""
@@ -329,8 +380,10 @@ class RealtimeCollector:
     def _maybe_attach_pinnacle(
         self, market: Dict[str, Any], ob_id: Optional[int], timestamp: int
     ) -> None:
-        """If this market is CS2 and has (or can obtain) a pinnacle link, write a
-        time-aligned pinnacle_snapshots row tied to the orderbook row."""
+        """If this market is CS2 and has (or can obtain) a pinnacle link, write
+        time-aligned pinnacle_snapshots rows tied to the orderbook row — one
+        row per linked bookmaker (ps3838, betway, tonybet) when canonical match
+        linkage is available, otherwise just the anchor book."""
         if market.get("game") != "cs2":
             return
         market_id = market.get("market_id")
@@ -338,65 +391,169 @@ class RealtimeCollector:
             return
 
         link = get_pinnacle_link(market_id)
-        if link is None:
+        if link is None or self._link_is_stale_unmatched(link):
             link = self._auto_link_market(market)
             if link is None:
                 return  # cs2odds unreachable — will retry next snapshot
 
         method = link.get("link_method")
-        pin_match_id = link.get("pin_match_id")
-        if method != "auto-fuzzy" and method != "manual":
-            return
-        if pin_match_id is None:
+        if method not in LINK_METHODS_FOR_SNAPSHOT:
             return
 
-        pin_match_id = self._maybe_promote_link_to_live(market_id, link, pin_match_id)
-
-        odds = pinnacle.fetch_match_odds(pin_match_id)
-        if odds is None:
+        anchor_book = link.get("bookmaker") or "ps3838"
+        anchor_match_id = link.get("pin_match_id")
+        canonical_id = link.get("canonical_match_id")
+        if anchor_match_id is None:
             return
+
+        # Resolve current anchor match_id (matchup -> live promotion). Only
+        # meaningful when we don't have a canonical_match_id; with the canonical
+        # path the /linked endpoint surfaces both feeds and we just pick live.
+        if not canonical_id:
+            anchor_match_id = self._maybe_promote_link_to_live(
+                market_id, link, anchor_match_id, anchor_book,
+            )
 
         pin_map_num = link.get("pin_map_num") or 0
-        snap = pinnacle.extract_snapshot_for_map(odds, pin_map_num)
-        if snap is None:
+        link_home = link.get("home_team")
+        link_away = link.get("away_team")
+
+        entries = self._collect_book_entries(
+            canonical_id=canonical_id,
+            anchor_book=anchor_book,
+            anchor_match_id=anchor_match_id,
+        )
+        if not entries:
             return
 
-        insert_pinnacle_snapshot(
-            orderbook_snapshot_id=ob_id,
-            market_id=market_id,
-            pin_match_id=pin_match_id,
-            timestamp=timestamp,
-            **snap,
-        )
+        for entry in entries:
+            self._write_book_snapshot(
+                entry=entry,
+                ob_id=ob_id,
+                market_id=market_id,
+                pin_map_num=pin_map_num,
+                link_home=link_home,
+                link_away=link_away,
+                timestamp=timestamp,
+            )
 
-    def _get_pin_matches_cached(self, ttl: float = 30.0) -> Optional[List[Dict[str, Any]]]:
-        """List of pinnacle matches with a short TTL — keeps the matchup→live promotion
-        cheap (one /matches call every 30s) when many markets are linked to the same event."""
-        now = time.time()
-        if self._pin_matches_cache is not None and (now - self._pin_matches_cache_ts) < ttl:
-            return self._pin_matches_cache
+    def _collect_book_entries(
+        self,
+        canonical_id: Optional[str],
+        anchor_book: str,
+        anchor_match_id: Any,
+    ) -> List[Dict[str, Any]]:
+        """Return a list of entries shaped like /linked's `entries` items.
+
+        With a canonical_id, prefer the live feed over the matchup feed when
+        both books surface the same fixture. Without one, fall back to a
+        single-book /odds fetch and synthesize a one-element list.
+        """
+        if canonical_id:
+            linked = pinnacle.fetch_linked(canonical_id)
+            if linked is None:
+                return []
+            entries = linked.get("entries") or []
+            # When the same book surfaces both matchup + live for the canonical
+            # fixture, drop the matchup. Live is what carries in-game movement.
+            by_book: Dict[str, Dict[str, Any]] = {}
+            for e in entries:
+                book = e.get("bookmaker")
+                if not book:
+                    continue
+                feed = (e.get("match") or {}).get("feed") or ""
+                existing = by_book.get(book)
+                if existing is None:
+                    by_book[book] = e
+                    continue
+                existing_feed = (existing.get("match") or {}).get("feed") or ""
+                if feed == "live" and existing_feed != "live":
+                    by_book[book] = e
+            return list(by_book.values())
+
+        odds = pinnacle.fetch_match_odds(anchor_book, anchor_match_id)
+        if odds is None:
+            return []
+        return [{
+            "bookmaker": anchor_book,
+            "match_id": anchor_match_id,
+            "match": odds.get("match") or {},
+            "periods": odds.get("periods") or {},
+            "last_seen_ms": odds.get("last_seen_ms"),
+        }]
+
+    def _write_book_snapshot(
+        self,
+        entry: Dict[str, Any],
+        ob_id: Optional[int],
+        market_id: str,
+        pin_map_num: int,
+        link_home: Optional[str],
+        link_away: Optional[str],
+        timestamp: int,
+    ) -> None:
+        bookmaker = entry.get("bookmaker") or "ps3838"
+        match_id = entry.get("match_id")
+        if match_id is None:
+            return
+        book_match = entry.get("match") or {}
+        swap = pinnacle.should_swap_home_away(
+            book_match.get("home"), book_match.get("away"), link_home, link_away,
+        )
+        odds_view = {
+            "match": book_match,
+            "periods": entry.get("periods") or {},
+            "last_seen_ms": entry.get("last_seen_ms"),
+        }
+        snap = pinnacle.extract_snapshot_for_map(odds_view, pin_map_num, swap_home_away=swap)
+        if snap is None:
+            return
         try:
-            self._pin_matches_cache = pinnacle.list_matches()
-            self._pin_matches_cache_ts = now
+            insert_pinnacle_snapshot(
+                orderbook_snapshot_id=ob_id,
+                market_id=market_id,
+                pin_match_id=str(match_id),
+                bookmaker=bookmaker,
+                timestamp=timestamp,
+                **snap,
+            )
+        except Exception as e:
+            logger.debug(f"pinnacle: insert snapshot {bookmaker}/{match_id} failed: {e}")
+
+    def _get_pin_matches_cached(self, bookmaker: str, ttl: float = 30.0) -> Optional[List[Dict[str, Any]]]:
+        """List of pinnacle matches for a single book with a short TTL — keeps
+        the matchup→live promotion cheap (one /matches call every 30s) when
+        many markets are linked to the same event. Cached per bookmaker since
+        cs2odds returns a mixed list by default but we promote per-book."""
+        now = time.time()
+        cached = self._pin_matches_caches.get(bookmaker)
+        if cached is not None and (now - cached[1]) < ttl:
+            return cached[0]
+        try:
+            data = pinnacle.list_matches(bookmaker=bookmaker)
+            self._pin_matches_caches[bookmaker] = (data, now)
+            return data
         except Exception:
-            return self._pin_matches_cache  # stale is better than nothing
-        return self._pin_matches_cache
+            return cached[0] if cached else None  # stale is better than nothing
 
     def _maybe_promote_link_to_live(
-        self, market_id: str, link: Dict[str, Any], pin_match_id: int
-    ) -> int:
-        """If the link points to a 'matchup' (frozen pre-match) feed and a 'live' child
-        exists, swap the link to the live match_id and persist. Returns the match_id to
-        actually fetch odds from for this snapshot."""
-        matches = self._get_pin_matches_cached()
+        self, market_id: str, link: Dict[str, Any], pin_match_id: Any, bookmaker: str,
+    ) -> Any:
+        """If the link points to a 'matchup' (frozen pre-match) feed and a
+        'live' child exists for the same book, swap the link to the live
+        match_id and persist. Used only when we have no canonical_match_id —
+        with canonical, /linked surfaces both feeds and we pick live there.
+        """
+        matches = self._get_pin_matches_cached(bookmaker)
         if not matches:
             return pin_match_id
-        cur = next((m for m in matches if m.get("match_id") == pin_match_id), None)
+        target_id = str(pin_match_id)
+        cur = next((m for m in matches if str(m.get("match_id")) == target_id), None)
         if cur is None or (cur.get("feed") or "") == "live":
             return pin_match_id
         live = next(
             (m for m in matches
-             if m.get("parent_match_id") == pin_match_id and (m.get("feed") or "") == "live"),
+             if str(m.get("parent_match_id") or "") == target_id and (m.get("feed") or "") == "live"),
             None,
         )
         if live is None:
@@ -412,11 +569,22 @@ class RealtimeCollector:
             away_team=live.get("away"),
             link_method=link.get("link_method") or "auto-fuzzy",
             confidence=link.get("confidence") or 1.0,
+            bookmaker=bookmaker,
+            canonical_match_id=live.get("canonical_match_id"),
         )
         logger.info(
-            f"pinnacle: promoted market {market_id} {pin_match_id} (matchup) -> {new_id} (live)"
+            f"pinnacle: promoted market {market_id} {bookmaker}/{pin_match_id} (matchup) -> {new_id} (live)"
         )
         return new_id
+
+    def _link_is_stale_unmatched(self, link: Dict[str, Any]) -> bool:
+        """Stop treating `unmatched` as terminal: a market that wasn't in cs2odds
+        when first checked may be tracked now (Pinnacle's window opens 24-48h
+        pre-match). Re-attempt after UNMATCHED_RETRY_TTL_S."""
+        if link.get("link_method") != "unmatched":
+            return False
+        linked_at = link.get("linked_at") or 0
+        return (int(time.time()) - linked_at) >= UNMATCHED_RETRY_TTL_S
 
     def _auto_link_market(self, market: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """One-shot fuzzy-match attempt. Persists the result (or the 'unmatched'
@@ -429,6 +597,12 @@ class RealtimeCollector:
         if method == "pinnacle-down":
             return None
 
+        if method == "outright":
+            # No-counterpart markets (tournament winners, qualifiers). Don't
+            # persist a link row — keeps the table free of permanently-dead rows.
+            logger.debug(f"pinnacle: skipping outright '{(market.get('question') or '')[:60]}'")
+            return None
+
         if method == "unmatched":
             upsert_pinnacle_link(
                 market_id=market_id,
@@ -439,8 +613,12 @@ class RealtimeCollector:
             logger.info(f"pinnacle: no match for '{(market.get('question') or '')[:60]}'")
             return get_pinnacle_link(market_id)
 
-        # auto-fuzzy hit
+        # auto-fuzzy hit — fuzzy_match_market prefers ps3838 on ties so the
+        # anchor row points at the most reliable book; canonical_match_id (when
+        # present) lets the snapshot loop fan out to all linked books.
         map_num = pinnacle.infer_map_num(market.get("question") or "")
+        anchor_book = pin_match.get("bookmaker") or "ps3838"
+        canonical_id = pin_match.get("canonical_match_id")
         upsert_pinnacle_link(
             market_id=market_id,
             pin_match_id=pin_match.get("match_id"),
@@ -449,11 +627,14 @@ class RealtimeCollector:
             away_team=pin_match.get("away"),
             link_method="auto-fuzzy",
             confidence=confidence,
+            bookmaker=anchor_book,
+            canonical_match_id=canonical_id,
         )
         logger.info(
             f"pinnacle: linked '{(market.get('question') or '')[:50]}' -> "
+            f"{anchor_book}/{pin_match.get('match_id')} "
             f"{pin_match.get('home')} vs {pin_match.get('away')} "
-            f"(match_id={pin_match.get('match_id')}, map={map_num}, conf={confidence:.2f})"
+            f"(map={map_num}, canon={canonical_id}, conf={confidence:.2f})"
         )
         return get_pinnacle_link(market_id)
 

@@ -1,16 +1,19 @@
 """Client + matcher for the cs2odds local HTTP API.
 
-The cs2odds daemon (a separate systemd service) runs an aiohttp server bound to
-127.0.0.1:8765 that exposes the freshest in-memory pinnacle CS2 odds. We hit it
-synchronously at the moment of each polymarket orderbook snapshot so the two
-sides are time-aligned, then store a no-vig snapshot in pinnacle_snapshots.
+The cs2odds daemon runs an aiohttp server (bound to 0.0.0.0:8765 on the windows
+host, reached over Tailscale at 100.110.66.95) that exposes the freshest
+in-memory CS2 odds for THREE bookmakers — ps3838, Betway, and Tonybet. cs2odds
+maintains a cross-book canonical_match_id so the same fixture on different
+books is linked. We hit /linked at each polymarket orderbook snapshot to fetch
+all linked books in a single call, then write one pinnacle_snapshots row per
+book.
 
-Match linking is best-effort fuzzy team-name matching. Polymarket questions are
-free-form ("Will Vitality beat Spirit?", "Vitality vs G2 — Map 3 winner") so we
-extract candidate team names from the question, compare to pinnacle's home/away
-strings, and emit a confidence score using SequenceMatcher's ratio. Above the
-threshold we record the link; below, we mark 'unmatched' and skip future
-attempts until manually overridden.
+Match linking is best-effort fuzzy team-name matching against the combined
+match list. Polymarket questions are free-form ("Will Vitality beat Spirit?",
+"Vitality vs G2 — Map 3 winner") so we extract candidate team names from the
+question, compare to each book's home/away strings, and pick the highest-
+scoring match — preferring ps3838 over the other books when scores tie because
+ps3838 has the deepest market coverage and most reliable identifiers.
 """
 from __future__ import annotations
 
@@ -30,19 +33,28 @@ from .utils import logger
 # ---------------------------------------------------------------------------
 
 
-def list_matches() -> List[Dict[str, Any]]:
-    """GET /matches — every match cs2odds currently knows about."""
-    r = requests.get(f"{PINNACLE_API_URL}/matches", timeout=PINNACLE_HTTP_TIMEOUT)
+def list_matches(bookmaker: Optional[str] = None) -> List[Dict[str, Any]]:
+    """GET /matches[?bookmaker=...] — every match cs2odds knows about.
+
+    Without `bookmaker`, returns matches from all books (each entry tagged with
+    bookmaker + canonical_match_id). Pass a book name to filter.
+    """
+    params = {"bookmaker": bookmaker} if bookmaker else {}
+    r = requests.get(f"{PINNACLE_API_URL}/matches", params=params, timeout=PINNACLE_HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
-def fetch_match_odds(pin_match_id: int) -> Optional[Dict[str, Any]]:
-    """GET /odds?match_id=... — returns None if cs2odds doesn't know the match."""
+def fetch_match_odds(bookmaker: str, pin_match_id: Any) -> Optional[Dict[str, Any]]:
+    """GET /odds?bookmaker=...&match_id=... — single-book fallback.
+
+    Used when the link has no canonical_match_id (the fixture is only tracked on
+    one book). Returns None if cs2odds doesn't know the match.
+    """
     try:
         r = requests.get(
             f"{PINNACLE_API_URL}/odds",
-            params={"match_id": pin_match_id},
+            params={"bookmaker": bookmaker, "match_id": str(pin_match_id)},
             timeout=PINNACLE_HTTP_TIMEOUT,
         )
         if r.status_code == 404:
@@ -50,7 +62,29 @@ def fetch_match_odds(pin_match_id: int) -> Optional[Dict[str, Any]]:
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
-        logger.debug(f"pinnacle: fetch_match_odds({pin_match_id}) failed: {e}")
+        logger.debug(f"pinnacle: fetch_match_odds({bookmaker}, {pin_match_id}) failed: {e}")
+        return None
+
+
+def fetch_linked(canonical_match_id: str) -> Optional[Dict[str, Any]]:
+    """GET /linked?canonical_match_id=... — every book tracking this fixture.
+
+    Returns {canonical_match_id, entries: [{bookmaker, match_id, match, periods,
+    last_seen_ms}, ...]}, or None if cs2odds has no in-memory entries linked to
+    that canonical id (e.g. all books rolled the fixture off after settlement).
+    """
+    try:
+        r = requests.get(
+            f"{PINNACLE_API_URL}/linked",
+            params={"canonical_match_id": canonical_match_id},
+            timeout=PINNACLE_HTTP_TIMEOUT,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        logger.debug(f"pinnacle: fetch_linked({canonical_match_id}) failed: {e}")
         return None
 
 
@@ -118,13 +152,22 @@ def novig_three_way(
 def extract_snapshot_for_map(
     odds: Dict[str, Any],
     pin_map_num: int,
+    swap_home_away: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Pull the pin_map_num period out of an /odds response and shape it for
-    insert_pinnacle_snapshot.
+    """Pull the pin_map_num period out of an /odds (or /linked entry) response
+    and shape it for insert_pinnacle_snapshot.
 
-    Returns a dict ready to **kwarg into the DB helper, minus the orderbook FK
-    and market_id (the caller adds those). Returns None if the requested period
-    isn't present (e.g. pre-match BO winner with no per-map prices yet).
+    Returns a dict ready to **kwarg into the DB helper, minus the orderbook FK,
+    market_id, and bookmaker (the caller adds those). Returns None if the
+    requested period isn't present (e.g. pre-match BO winner with no per-map
+    prices yet).
+
+    `swap_home_away` flips home↔away in the output (and flips the spread line
+    sign) so the snapshot stays in the link's canonical home_team perspective
+    even when the source book labels the teams in the opposite order. Betway,
+    for example, reports Vitality as home for fixtures where ps3838 reports
+    GamerLegion as home — the collector resolves that against the link's stored
+    home_team and passes swap=True when needed.
     """
     periods = odds.get("periods") or {}
     rows = periods.get(str(pin_map_num)) or periods.get(pin_map_num)
@@ -150,7 +193,7 @@ def extract_snapshot_for_map(
             elif side == "draw":
                 ml_draw_dec = price
         elif market == "spread" and isinstance(line, (int, float)):
-            # Pinnacle emits home -1.5 and away +1.5 as separate rows for the
+            # cs2odds emits home -1.5 and away +1.5 as separate rows for the
             # same handicap. Normalize to home's perspective so the two legs
             # land in one bucket and can be no-vig-paired.
             norm_line = float(line) if side == "home" else -float(line)
@@ -160,6 +203,21 @@ def extract_snapshot_for_map(
             slot = totals_by_line.setdefault(float(line), {})
             slot[side] = price
 
+    if swap_home_away:
+        ml_home_dec, ml_away_dec = ml_away_dec, ml_home_dec
+        # Flip line sign and swap legs: a -1.5 home line becomes a +1.5 line for
+        # the new home (which was the old away).
+        flipped: Dict[float, Dict[str, float]] = {}
+        for ln, slot in spreads_by_line.items():
+            new_slot: Dict[str, float] = {}
+            if "home" in slot:
+                new_slot["away"] = slot["home"]
+            if "away" in slot:
+                new_slot["home"] = slot["away"]
+            flipped[-ln] = new_slot
+        spreads_by_line = flipped
+        # Totals are direction-keyed (over/under), not team-keyed — no change.
+
     ml_h_nv, ml_a_nv, ml_d_nv = novig_three_way(ml_home_dec, ml_away_dec, ml_draw_dec)
 
     spreads = []
@@ -168,9 +226,9 @@ def extract_snapshot_for_map(
         h_dec, a_dec = slot.get("home"), slot.get("away")
         h_nv, a_nv = novig_two_way(h_dec, a_dec)
         spreads.append({
-            "line": -ln,
-            "home_implied": implied(a_dec), "away_implied": implied(h_dec),
-            "home_novig": a_nv, "away_novig": h_nv,
+            "line": ln,
+            "home_implied": implied(h_dec), "away_implied": implied(a_dec),
+            "home_novig": h_nv, "away_novig": a_nv,
         })
 
     totals = []
@@ -185,25 +243,38 @@ def extract_snapshot_for_map(
         })
 
     match_meta = odds.get("match") or {}
-    # cs2odds labels team strings as home=event[1]/away=event[2] but the price
-    # arrays (moneyline[0], spread[3]) are anchored to a different team than the
-    # event[1] string for CS2 — empirically verified against Polymarket prices on
-    # 2026-05-01 G2 vs FaZe (PM mid aligns with Pinnacle's "away" no-vig within
-    # 8pp; "home" diverges 30-80pp). Swap here so ml_home_* reflects the team
-    # named in pinnacle_match_links.home_team. Spreads also flip the line sign.
     return {
         "pin_map_num": pin_map_num,
         "is_live": match_meta.get("feed") == "live",
-        "ml_home_implied": implied(ml_away_dec),
-        "ml_away_implied": implied(ml_home_dec),
+        "ml_home_implied": implied(ml_home_dec),
+        "ml_away_implied": implied(ml_away_dec),
         "ml_draw_implied": implied(ml_draw_dec),
-        "ml_home_novig": ml_a_nv,
-        "ml_away_novig": ml_h_nv,
+        "ml_home_novig": ml_h_nv,
+        "ml_away_novig": ml_a_nv,
         "ml_draw_novig": ml_d_nv,
         "spreads": spreads if spreads else None,
         "totals": totals if totals else None,
         "pin_observed_at_ms": odds.get("last_seen_ms"),
     }
+
+
+def should_swap_home_away(
+    book_home: Optional[str],
+    book_away: Optional[str],
+    link_home: Optional[str],
+    link_away: Optional[str],
+) -> bool:
+    """True if the source book's home is actually the link's away (and vice
+    versa). Used by the collector to normalize cross-book home/away ordering.
+
+    Compares book_home against link_home vs link_away by fuzzy ratio. Falls
+    back to no-swap when any side is missing or the comparison is ambiguous.
+    """
+    if not book_home or not book_away or not link_home or not link_away:
+        return False
+    home_to_home = _ratio(book_home, link_home)
+    home_to_away = _ratio(book_home, link_away)
+    return home_to_away > home_to_home
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +286,29 @@ _TEAM_TOKEN_RE = re.compile(r"[A-Za-z0-9.\-']+(?:\s+[A-Za-z0-9.\-']+){0,3}")
 _VS_RE = re.compile(r"\bvs?\.?\b|\b@\b|\bversus\b", re.IGNORECASE)
 _MAP_NUM_RE = re.compile(r"\b(?:map|game)\s*(\d)\b", re.IGNORECASE)
 
+# Outright/futures markets that have no per-match Pinnacle counterpart. Examples:
+#   "Will MOUZ win IEM Cologne Major 2026?"
+#   "Will Team Liquid qualify to IEM Cologne Major 2026?"
+# Detecting these up front avoids polluting pinnacle_match_links with thousands of
+# permanently-unmatchable rows.
+_OUTRIGHT_PATTERNS = (
+    re.compile(r"\bqualif(?:y|ies|ied)\s+(?:to|for)\b", re.IGNORECASE),
+    re.compile(r"\bwin\s+(?:the\s+)?(?:iem|esl|blast|pgl|major|championship|tournament)", re.IGNORECASE),
+    re.compile(r"\b(?:reach|advance to)\s+(?:the\s+)?(?:final|grand final|playoffs|semis?)", re.IGNORECASE),
+)
+
 
 _TEAM_NOISE_TOKENS = {"team", "esports", "esport", "gaming", "the"}
+
+
+def is_outright_question(question: Optional[str]) -> bool:
+    """True if the question is a tournament outright/qualifier (no head-to-head Pinnacle counterpart)."""
+    if not question:
+        return False
+    # Outrights never have a "X vs Y" structure — that's the cheap signal.
+    if _VS_RE.search(question):
+        return False
+    return any(p.search(question) for p in _OUTRIGHT_PATTERNS)
 
 
 def _normalize(s: str) -> str:
@@ -309,16 +401,16 @@ def fuzzy_match_market(
     matches: List[Dict[str, Any]],
     threshold: float = PINNACLE_FUZZY_THRESHOLD,
 ) -> Optional[Tuple[Dict[str, Any], float]]:
-    """Pick the best pinnacle match for a polymarket question.
+    """Pick the best pinnacle match for a polymarket question across all books.
 
     Scoring: average of (best home-team match ratio, best away-team match ratio)
     across the candidate splits. Both teams must exceed the threshold for a hit.
 
-    Once the match starts, cs2odds emits both a 'matchup' (frozen pre-match) and
-    'live' (in-game) entry for the same teams — both score 1.0 here. Prefer the
-    live one so we capture in-game line movement instead of stale pre-match.
-
-    Returns (match_dict, confidence) or None.
+    Tie-breakers, in order of preference:
+      1. live feed > matchup feed (in-game line movement is what we want)
+      2. ps3838 > betway > tonybet (deepest market coverage and most reliable
+         identifiers — the anchor row's bookmaker)
+      3. raw fuzzy score
     """
     if not matches:
         return None
@@ -334,7 +426,7 @@ def fuzzy_match_market(
         away = m.get("away") or ""
         if not home or not away:
             continue
-        # Try both orderings — polymarket question order may not match pinnacle's
+        # Try both orderings — polymarket question order may not match the book's
         score_ab_min = min(_ratio(cand_a, home), _ratio(cand_b, away))
         score_ba_min = min(_ratio(cand_a, away), _ratio(cand_b, home))
         score = max(score_ab_min, score_ba_min)
@@ -344,23 +436,41 @@ def fuzzy_match_market(
     if not hits:
         return None
 
-    hits.sort(key=lambda h: (1 if (h[0].get("feed") or "") == "live" else 0, h[1]), reverse=True)
+    _book_pref = {"ps3838": 2, "betway": 1, "tonybet": 0}
+    hits.sort(
+        key=lambda h: (
+            1 if (h[0].get("feed") or "") == "live" else 0,
+            _book_pref.get(h[0].get("bookmaker") or "", -1),
+            h[1],
+        ),
+        reverse=True,
+    )
     return hits[0]
 
 
-def attempt_link_for_market(market: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]], Optional[float]]:
+def attempt_link_for_market(
+    market: Dict[str, Any],
+    matches: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, Optional[Dict[str, Any]], Optional[float]]:
     """Run a one-shot fuzzy-match attempt for a polymarket market.
 
-    Returns (link_method, pinnacle_match_dict_or_None, confidence_or_None).
-    link_method is one of: 'auto-fuzzy', 'unmatched', 'pinnacle-down'.
-    """
-    try:
-        matches = list_matches()
-    except requests.RequestException as e:
-        logger.debug(f"pinnacle: list_matches failed during link attempt: {e}")
-        return ("pinnacle-down", None, None)
+    `matches` lets the caller pass a cached match list — useful in batch backfills
+    where one /matches call serves thousands of attempts. When omitted, fetches fresh.
 
+    Returns (link_method, pinnacle_match_dict_or_None, confidence_or_None).
+    link_method is one of: 'auto-fuzzy', 'unmatched', 'outright', 'pinnacle-down'.
+    """
     question = market.get("question") or ""
+    if is_outright_question(question):
+        return ("outright", None, None)
+
+    if matches is None:
+        try:
+            matches = list_matches()
+        except requests.RequestException as e:
+            logger.debug(f"pinnacle: list_matches failed during link attempt: {e}")
+            return ("pinnacle-down", None, None)
+
     hit = fuzzy_match_market(question, matches)
     if hit is None:
         return ("unmatched", None, None)

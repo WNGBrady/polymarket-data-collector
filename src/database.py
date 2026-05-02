@@ -251,29 +251,31 @@ def init_database() -> None:
         )
     """)
 
-    # Pinnacle (ps3838) match-to-market link.
-    # One row per polymarket market that has been resolved (or attempted) against
-    # a ps3838 event id + map number. link_method='unmatched' is a sentinel that
-    # means "we tried fuzzy-matching and couldn't find a counterpart" — it stops
-    # us re-running the fuzzy search every snapshot.
+    # Pinnacle match-to-market link. Anchor row per polymarket market: stores the
+    # bookmaker that fuzzy-matched first (preferring ps3838) and cs2odds's
+    # cross-book canonical_match_id when available. At snapshot time the
+    # collector fans out via GET /linked to fetch all books in one call.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS pinnacle_match_links (
-            market_id      TEXT PRIMARY KEY,
-            pin_match_id   INTEGER,
-            pin_map_num    INTEGER,
-            home_team      TEXT,
-            away_team      TEXT,
-            link_method    TEXT,
-            confidence     REAL,
-            linked_at      INTEGER,
+            market_id           TEXT PRIMARY KEY,
+            pin_match_id        INTEGER,
+            pin_map_num         INTEGER,
+            home_team           TEXT,
+            away_team           TEXT,
+            link_method         TEXT,
+            confidence          REAL,
+            linked_at           INTEGER,
+            bookmaker           TEXT NOT NULL DEFAULT 'ps3838',
+            canonical_match_id  TEXT,
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         )
     """)
 
     # Per-snapshot pinnacle odds, paired with a polymarket orderbook snapshot.
-    # No-vig probabilities are pre-computed at write time so analysis queries
-    # don't re-derive them. Spreads/totals are stored as JSON arrays of alt-line
-    # tuples to keep this table to one row per (orderbook snapshot, match/map).
+    # One row per (orderbook snapshot, bookmaker) — same fixture appears once per
+    # linked book. No-vig probabilities are pre-computed at write time. Snapshots
+    # are normalized to the link's home_team perspective even when the source
+    # book reports the opposite side as home.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS pinnacle_snapshots (
             id                     INTEGER PRIMARY KEY,
@@ -292,6 +294,7 @@ def init_database() -> None:
             spreads_json           TEXT,
             totals_json            TEXT,
             pin_observed_at_ms     INTEGER,
+            bookmaker              TEXT NOT NULL DEFAULT 'ps3838',
             FOREIGN KEY (orderbook_snapshot_id) REFERENCES orderbook_snapshots(id),
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         )
@@ -365,7 +368,9 @@ def init_database() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_orderbook ON pinnacle_snapshots(orderbook_snapshot_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_match ON pinnacle_snapshots(pin_match_id, pin_map_num, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_market ON pinnacle_snapshots(market_id, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_market_book ON pinnacle_snapshots(market_id, bookmaker, timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_links_match ON pinnacle_match_links(pin_match_id, pin_map_num)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_links_canonical ON pinnacle_match_links(canonical_match_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_bot_label ON wallets(bot_label)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_volume ON wallets(total_volume_usd DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_signals_name ON cs2_wallet_signals(signal_name)")
@@ -510,6 +515,30 @@ def migrate_database() -> None:
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         )
     """)
+
+    # Multi-book columns. cs2odds (the upstream odds scraper) gained Betway and
+    # Tonybet adapters alongside ps3838; rows are tagged by which book they came
+    # from. canonical_match_id is cs2odds's cross-book linkage — when present,
+    # the snapshot writer fans out via GET /linked to capture all three books in
+    # one pass. Existing rows backfill to 'ps3838' since that's all there was.
+    cursor.execute("PRAGMA table_info(pinnacle_match_links)")
+    link_cols = {row["name"] for row in cursor.fetchall()}
+    if "bookmaker" not in link_cols:
+        cursor.execute(
+            "ALTER TABLE pinnacle_match_links ADD COLUMN bookmaker TEXT NOT NULL DEFAULT 'ps3838'"
+        )
+    if "canonical_match_id" not in link_cols:
+        cursor.execute("ALTER TABLE pinnacle_match_links ADD COLUMN canonical_match_id TEXT")
+
+    cursor.execute("PRAGMA table_info(pinnacle_snapshots)")
+    snap_cols = {row["name"] for row in cursor.fetchall()}
+    if "bookmaker" not in snap_cols:
+        cursor.execute(
+            "ALTER TABLE pinnacle_snapshots ADD COLUMN bookmaker TEXT NOT NULL DEFAULT 'ps3838'"
+        )
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_links_canonical ON pinnacle_match_links(canonical_match_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_market_book ON pinnacle_snapshots(market_id, bookmaker, timestamp)")
 
     conn.commit()
 
@@ -904,28 +933,34 @@ def compute_and_store_closing_lines(game_id: str, match_data: Dict[str, Any]) ->
 
 def upsert_pinnacle_link(
     market_id: str,
-    pin_match_id: Optional[int],
+    pin_match_id: Optional[Any],
     pin_map_num: Optional[int],
     home_team: Optional[str],
     away_team: Optional[str],
     link_method: str,
     confidence: Optional[float],
+    bookmaker: str = "ps3838",
+    canonical_match_id: Optional[str] = None,
 ) -> None:
-    """Insert or replace a pinnacle match link for a polymarket market.
+    """Insert or replace the pinnacle anchor link for a polymarket market.
 
     `link_method='unmatched'` is the sentinel used when fuzzy matching failed —
     it stops the realtime collector from re-running the search every snapshot.
+    `bookmaker` identifies which book this anchor row points at (ps3838 preferred);
+    `canonical_match_id` is cs2odds's cross-book linkage used to fan out to all
+    linked books at snapshot time.
     """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT OR REPLACE INTO pinnacle_match_links
         (market_id, pin_match_id, pin_map_num, home_team, away_team,
-         link_method, confidence, linked_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         link_method, confidence, linked_at, bookmaker, canonical_match_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         market_id, pin_match_id, pin_map_num, home_team, away_team,
         link_method, confidence, int(time.time()),
+        bookmaker, canonical_match_id,
     ))
     conn.commit()
 
@@ -942,7 +977,7 @@ def get_pinnacle_link(market_id: str) -> Optional[Dict[str, Any]]:
 def insert_pinnacle_snapshot(
     orderbook_snapshot_id: Optional[int],
     market_id: Optional[str],
-    pin_match_id: int,
+    pin_match_id: Any,
     pin_map_num: int,
     timestamp: int,
     is_live: Optional[bool],
@@ -955,11 +990,15 @@ def insert_pinnacle_snapshot(
     spreads: Optional[List[Dict[str, Any]]],
     totals: Optional[List[Dict[str, Any]]],
     pin_observed_at_ms: Optional[int],
+    bookmaker: str = "ps3838",
 ) -> None:
     """Insert a pinnacle odds snapshot, optionally linked to an orderbook row.
 
     All probabilities are on the 0-1 scale (same as polymarket prices).
     *_implied = 1/dec (carries the vig); *_novig = vig stripped via proportional method.
+    Multiple rows are written per orderbook snapshot — one per linked bookmaker
+    (ps3838, betway, tonybet) — and all are normalized to the link's home_team
+    perspective so home/away semantics are stable across books.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -968,8 +1007,8 @@ def insert_pinnacle_snapshot(
         (orderbook_snapshot_id, market_id, pin_match_id, pin_map_num, timestamp,
          is_live, ml_home_implied, ml_away_implied, ml_draw_implied,
          ml_home_novig, ml_away_novig, ml_draw_novig,
-         spreads_json, totals_json, pin_observed_at_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         spreads_json, totals_json, pin_observed_at_ms, bookmaker)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         orderbook_snapshot_id, market_id, pin_match_id, pin_map_num, timestamp,
         1 if is_live else (0 if is_live is False else None),
@@ -978,6 +1017,7 @@ def insert_pinnacle_snapshot(
         json.dumps(spreads) if spreads is not None else None,
         json.dumps(totals) if totals is not None else None,
         pin_observed_at_ms,
+        bookmaker,
     ))
     conn.commit()
 

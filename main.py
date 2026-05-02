@@ -447,6 +447,10 @@ async def run_continuous_mode(args):
                     if new_found:
                         logger.info(f"Found {len(new_found)} new markets, backfilling historical data...")
                         run_historical_collection(new_found)
+                        # Push them into the running collector so the polling loops
+                        # see them this round (rebinding the local `markets` is not
+                        # enough — collector.markets was captured at startup).
+                        await collector.add_markets(new_found)
                         markets = new_markets
 
                     last_discovery_time = time.time()
@@ -620,15 +624,19 @@ def cmd_link_pinnacle(args):
         logger.error("--link-pinnacle requires --market-id, --pin-match-id, and --pin-map-num")
         return 1
 
-    # Look up the home/away from cs2odds for the audit trail
-    home_team = away_team = None
-    odds = pin.fetch_match_odds(args.pin_match_id)
+    bookmaker = (getattr(args, "bookmaker", None) or "ps3838").lower()
+
+    # Look up the home/away (and canonical_match_id when available) from cs2odds
+    # for the audit trail and to enable cross-book fan-out at snapshot time.
+    home_team = away_team = canonical_id = None
+    odds = pin.fetch_match_odds(bookmaker, args.pin_match_id)
     if odds:
         meta = odds.get("match") or {}
         home_team = meta.get("home")
         away_team = meta.get("away")
+        canonical_id = odds.get("canonical_match_id")
     else:
-        logger.warning(f"cs2odds doesn't currently know match_id={args.pin_match_id}; saving link anyway")
+        logger.warning(f"cs2odds doesn't currently know {bookmaker}/match_id={args.pin_match_id}; saving link anyway")
 
     upsert_pinnacle_link(
         market_id=args.market_id,
@@ -638,12 +646,39 @@ def cmd_link_pinnacle(args):
         away_team=away_team,
         link_method="manual",
         confidence=1.0,
+        bookmaker=bookmaker,
+        canonical_match_id=canonical_id,
     )
     print(
         f"Linked market_id={args.market_id} -> "
-        f"pin_match_id={args.pin_match_id} map={args.pin_map_num} "
-        f"({home_team} vs {away_team})"
+        f"{bookmaker}/{args.pin_match_id} map={args.pin_map_num} "
+        f"({home_team} vs {away_team}, canonical={canonical_id})"
     )
+    return 0
+
+
+def cmd_backfill_pinnacle_links(args):
+    """Walk all CS2 markets and run a fuzzy + event-inheritance link pass."""
+    from src.pinnacle_backfill import backfill_links
+
+    games = _resolve_games(args)
+    if "cs2" not in games:
+        logger.error("--backfill-pinnacle-links currently only supports --game cs2")
+        return 1
+
+    summary = backfill_links(game="cs2", include_stale_hours=args.include_stale_hours)
+
+    pa = summary["phase_fuzzy"]
+    pb = summary["phase_event_inherit"]
+    print(f"\nPinnacle link backfill ({summary['game']}):")
+    print(f"  Candidates considered: {summary['candidates']}")
+    print(f"  Phase A (fuzzy):")
+    print(f"    linked:    {pa['linked']}")
+    print(f"    unmatched: {pa['unmatched']}")
+    print(f"    outright:  {pa['outright']}")
+    if pa.get("skipped_no_pinnacle"):
+        print(f"    skipped (cs2odds unreachable): {pa['skipped_no_pinnacle']}")
+    print(f"  Phase B (event-inherited): {pb['inherited']}")
     return 0
 
 
@@ -804,9 +839,23 @@ Examples:
         action="store_true",
         help="Manually link a polymarket market to a pinnacle match (use with --market-id, --pin-match-id, --pin-map-num)"
     )
+    parser.add_argument(
+        "--backfill-pinnacle-links",
+        action="store_true",
+        help="Walk all CS2 markets and run a fuzzy + event-inheritance link pass against the current cs2odds match list"
+    )
+    parser.add_argument(
+        "--include-stale-hours",
+        type=int,
+        default=4,
+        help="Re-attempt 'unmatched' links older than this many hours (default 4) — paired with --backfill-pinnacle-links"
+    )
     parser.add_argument("--market-id", type=str, default=None)
-    parser.add_argument("--pin-match-id", type=int, default=None)
+    parser.add_argument("--pin-match-id", type=str, default=None,
+                        help="cs2odds match id — numeric string for ps3838/betway/tonybet; passed as TEXT")
     parser.add_argument("--pin-map-num", type=int, default=None)
+    parser.add_argument("--bookmaker", type=str, default="ps3838",
+                        help="cs2odds bookmaker tag for --link-pinnacle: ps3838 (default), betway, or tonybet")
 
     args = parser.parse_args()
 
@@ -822,7 +871,7 @@ Examples:
         args.list, args.all, args.orderbook, args.discover_tags,
         args.continuous, args.sports_ws, args.open_interest,
         args.trading, args.verify_sportsbook,
-        args.pinnacle_status, args.link_pinnacle,
+        args.pinnacle_status, args.link_pinnacle, args.backfill_pinnacle_links,
         args.backfill_trades, args.recompute_wallets,
     ]
     if not any(commands):
@@ -883,6 +932,9 @@ Examples:
 
         if args.link_pinnacle:
             return cmd_link_pinnacle(args)
+
+        if args.backfill_pinnacle_links:
+            return cmd_backfill_pinnacle_links(args)
 
         return 0
     finally:
