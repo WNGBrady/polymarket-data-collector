@@ -229,6 +229,14 @@ FAST_ORDERBOOK_POLL_INTERVAL = 10  # seconds
 FAST_ORDERBOOK_CONCURRENCY = 8  # parallel HTTP fetches per fast-tier round
 TIER1_CS2_KEYWORDS = ["iem", "esl pro league", "blast", "pgl"]
 
+# Periodic trades polling in continuous mode. The historical backfill at startup
+# only pulls trades once per market; without this loop, trades for existing
+# markets stop flowing until the next service restart (the system was previously
+# relying on OOM-restarts as a hidden trades cron).
+TRADES_POLL_ENABLED = os.environ.get("TRADES_POLL_ENABLED", "1").lower() in {"1", "true", "yes"}
+TRADES_FAST_POLL_INTERVAL = int(os.environ.get("TRADES_FAST_POLL_INTERVAL", "60"))
+TRADES_SLOW_POLL_INTERVAL = int(os.environ.get("TRADES_SLOW_POLL_INTERVAL", "600"))
+
 # Continuous mode settings
 DISCOVERY_INTERVAL = 1800  # 30 minutes between market discovery runs
 

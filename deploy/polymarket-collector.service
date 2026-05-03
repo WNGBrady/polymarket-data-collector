@@ -14,8 +14,13 @@ RestartSec=10
 # Ensure logs appear immediately in journald
 Environment=PYTHONUNBUFFERED=1
 
-# Memory guard — reduced from 800M to leave room for the API service (~100MB)
-MemoryMax=600M
+# Trading credentials and configuration (created by setup.sh)
+EnvironmentFile=-/etc/polymarket/trading.env
+
+# Memory guard — bumped 600M → 800M after periodic trades polling was added
+# (Phase 2). Box has 1.9G total; api service is capped at 256M, leaves slack
+# for kernel + nginx. OOM-restart was masking dropped trades capture.
+MemoryMax=800M
 
 # Logging via journald (view with: journalctl -u polymarket-collector -f)
 StandardOutput=journal

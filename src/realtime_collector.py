@@ -14,6 +14,9 @@ from .config import (
     FAST_ORDERBOOK_POLL_INTERVAL,
     FAST_ORDERBOOK_CONCURRENCY,
     TIER1_CS2_KEYWORDS,
+    TRADES_POLL_ENABLED,
+    TRADES_FAST_POLL_INTERVAL,
+    TRADES_SLOW_POLL_INTERVAL,
 )
 from .database import (
     get_all_markets,
@@ -24,7 +27,7 @@ from .database import (
     upsert_pinnacle_link,
     insert_pinnacle_snapshot,
 )
-from .historical_collector import fetch_orderbook, process_orderbook
+from .historical_collector import fetch_orderbook, process_orderbook, collect_trades_for_market
 from . import pinnacle
 from .utils import logger, safe_float
 
@@ -135,6 +138,8 @@ class RealtimeCollector:
         self.markets: List[Dict[str, Any]] = []
         self._orderbook_task: Optional[asyncio.Task] = None
         self._orderbook_fast_task: Optional[asyncio.Task] = None
+        self._trades_task: Optional[asyncio.Task] = None
+        self._trades_last_poll: Dict[str, float] = {}
         # Per-bookmaker /matches cache: {bookmaker: (matches, timestamp)}.
         # Keyed by book because matchup→live promotion fans out per book.
         self._pin_matches_caches: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
@@ -732,6 +737,56 @@ class RealtimeCollector:
                 logger.error(f"Error in fast orderbook polling: {e}")
                 await asyncio.sleep(5)
 
+    async def _poll_trades(self) -> None:
+        """Periodically re-pull trades for known markets so transactional data
+        keeps flowing between service restarts. Tier-1 CS2 map markets poll on
+        TRADES_FAST_POLL_INTERVAL; everything else uses TRADES_SLOW_POLL_INTERVAL.
+
+        collect_trades_for_market always re-paginates from offset=0. The
+        ON CONFLICT(trade_id) upsert in insert_trades makes that safe but
+        wasteful — incremental fetch is a follow-up.
+        """
+        logger.info(
+            f"Starting trades polling (fast={TRADES_FAST_POLL_INTERVAL}s, "
+            f"slow={TRADES_SLOW_POLL_INTERVAL}s)..."
+        )
+
+        while self.running:
+            try:
+                fast_ids = compute_fast_tier_market_ids(self.markets)
+                now = time.time()
+
+                for market in self.markets:
+                    if not self.running:
+                        break
+                    market_id = market.get("market_id")
+                    if not market_id:
+                        continue
+                    interval = (
+                        TRADES_FAST_POLL_INTERVAL
+                        if str(market_id) in fast_ids
+                        else TRADES_SLOW_POLL_INTERVAL
+                    )
+                    last = self._trades_last_poll.get(market_id, 0.0)
+                    if (now - last) < interval:
+                        continue
+                    try:
+                        await asyncio.to_thread(collect_trades_for_market, market)
+                    except Exception as e:
+                        logger.debug(
+                            f"trades poll failed for {str(market_id)[:20]}...: {e}"
+                        )
+                    self._trades_last_poll[market_id] = time.time()
+                    await asyncio.sleep(0.1)
+
+                await asyncio.sleep(5)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in trades polling: {e}")
+                await asyncio.sleep(5)
+
     async def run(self, markets: Optional[List[Dict[str, Any]]] = None) -> None:
         """
         Run the real-time collector.
@@ -768,6 +823,9 @@ class RealtimeCollector:
             self._orderbook_task = asyncio.create_task(self._poll_orderbooks())
             self._orderbook_fast_task = asyncio.create_task(self._poll_orderbooks_fast())
 
+        if TRADES_POLL_ENABLED:
+            self._trades_task = asyncio.create_task(self._poll_trades())
+
         try:
             while self.running:
                 connected = await self.connect()
@@ -785,7 +843,7 @@ class RealtimeCollector:
                     )
         finally:
             # Clean up orderbook polling tasks
-            for task in (self._orderbook_task, self._orderbook_fast_task):
+            for task in (self._orderbook_task, self._orderbook_fast_task, self._trades_task):
                 if task:
                     task.cancel()
                     try:
