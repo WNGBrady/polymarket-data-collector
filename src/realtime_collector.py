@@ -13,10 +13,16 @@ from .config import (
     ORDERBOOK_POLL_INTERVAL,
     FAST_ORDERBOOK_POLL_INTERVAL,
     FAST_ORDERBOOK_CONCURRENCY,
+    FAST_OVERRIDE_MARKET_IDS,
+    FAST_OVERRIDE_INTERVAL,
     TIER1_CS2_KEYWORDS,
     TRADES_POLL_ENABLED,
     TRADES_FAST_POLL_INTERVAL,
     TRADES_SLOW_POLL_INTERVAL,
+    KALSHI_TICKERS,
+    KALSHI_POLL_INTERVAL,
+    KALSHI_TRADES_POLL_INTERVAL,
+    KALSHI_CONCURRENCY,
 )
 from .database import (
     get_all_markets,
@@ -26,9 +32,13 @@ from .database import (
     get_pinnacle_link,
     upsert_pinnacle_link,
     insert_pinnacle_snapshot,
+    insert_kalshi_orderbook_snapshot,
+    insert_kalshi_trades_batch,
+    get_last_kalshi_trade_ts,
 )
 from .historical_collector import fetch_orderbook, process_orderbook, collect_trades_for_market
 from . import pinnacle
+from . import kalshi as kalshi_client
 from .utils import logger, safe_float
 
 
@@ -139,7 +149,12 @@ class RealtimeCollector:
         self._orderbook_task: Optional[asyncio.Task] = None
         self._orderbook_fast_task: Optional[asyncio.Task] = None
         self._trades_task: Optional[asyncio.Task] = None
+        self._kalshi_orderbook_task: Optional[asyncio.Task] = None
+        self._kalshi_trades_task: Optional[asyncio.Task] = None
         self._trades_last_poll: Dict[str, float] = {}
+        # Per-market last-poll for the fast tier; only consulted when the
+        # FAST_OVERRIDE_MARKET_IDS env var is non-empty (per-match tighter cadence).
+        self._fast_last_poll: Dict[str, float] = {}
         # Per-bookmaker /matches cache: {bookmaker: (matches, timestamp)}.
         # Keyed by book because matchup→live promotion fans out per book.
         self._pin_matches_caches: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
@@ -686,10 +701,17 @@ class RealtimeCollector:
         HTTP fetches run in parallel via a thread pool (semaphore-limited concurrency).
         DB inserts stay sequential on the event loop to avoid SQLite contention with the
         slow loop, which shares the same connection without a write lock around inserts.
+
+        FAST_OVERRIDE_MARKET_IDS (env-gated, normally empty) bumps the listed markets
+        to FAST_OVERRIDE_INTERVAL (~2s) for per-match lead/lag detail; non-overridden
+        fast-tier markets stay on the regular FAST_ORDERBOOK_POLL_INTERVAL (~10s).
         """
+        override_active = bool(FAST_OVERRIDE_MARKET_IDS)
+        outer_interval = FAST_OVERRIDE_INTERVAL if override_active else FAST_ORDERBOOK_POLL_INTERVAL
         logger.info(
-            f"Starting fast orderbook polling (every {FAST_ORDERBOOK_POLL_INTERVAL}s, "
-            f"concurrency={FAST_ORDERBOOK_CONCURRENCY}) for tier-1 CS2 map markets..."
+            f"Starting fast orderbook polling (default={FAST_ORDERBOOK_POLL_INTERVAL}s, "
+            f"override={FAST_OVERRIDE_INTERVAL}s for {len(FAST_OVERRIDE_MARKET_IDS)} markets, "
+            f"outer_tick={outer_interval}s, concurrency={FAST_ORDERBOOK_CONCURRENCY})..."
         )
 
         sem = asyncio.Semaphore(FAST_ORDERBOOK_CONCURRENCY)
@@ -704,13 +726,36 @@ class RealtimeCollector:
             try:
                 round_start = time.time()
                 fast_ids = compute_fast_tier_market_ids(self.markets)
-                tier1 = [m for m in self.markets if str(m.get("market_id")) in fast_ids]
+                # Union override markets in even if discovery hasn't tagged them tier-1
+                # yet (e.g. early in a tournament before keywords surface).
+                tier1 = [
+                    m for m in self.markets
+                    if str(m.get("market_id")) in fast_ids
+                    or str(m.get("market_id")) in FAST_OVERRIDE_MARKET_IDS
+                ]
 
-                if tier1:
+                if override_active:
+                    due: List[Dict[str, Any]] = []
+                    for m in tier1:
+                        mid = str(m.get("market_id"))
+                        interval = (
+                            FAST_OVERRIDE_INTERVAL
+                            if mid in FAST_OVERRIDE_MARKET_IDS
+                            else FAST_ORDERBOOK_POLL_INTERVAL
+                        )
+                        last = self._fast_last_poll.get(mid, 0.0)
+                        if (round_start - last) >= interval - 0.05:
+                            due.append(m)
+                    targets = due
+                else:
+                    targets = tier1
+
+                if targets:
                     results = await asyncio.gather(
-                        *(fetch_with_sem(m) for m in tier1),
+                        *(fetch_with_sem(m) for m in targets),
                         return_exceptions=False,
                     )
+                    poll_ts = time.time()
                     for r in results:
                         if r is None:
                             continue
@@ -719,15 +764,18 @@ class RealtimeCollector:
                             self._persist_snapshot(market, token_id, processed, ts)
                         except Exception as e:
                             logger.debug(f"Error persisting snapshot {str(market.get('market_id'))[:20]}...: {e}")
+                    if override_active:
+                        for m in targets:
+                            self._fast_last_poll[str(m.get("market_id"))] = poll_ts
 
                 elapsed = time.time() - round_start
-                remaining = FAST_ORDERBOOK_POLL_INTERVAL - elapsed
+                remaining = outer_interval - elapsed
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                 else:
                     logger.warning(
                         f"Fast orderbook round took {elapsed:.1f}s "
-                        f"(>{FAST_ORDERBOOK_POLL_INTERVAL}s target, {len(tier1)} markets)"
+                        f"(>{outer_interval}s tick, {len(targets)} markets polled)"
                     )
                     await asyncio.sleep(0)
 
@@ -787,6 +835,101 @@ class RealtimeCollector:
                 logger.error(f"Error in trades polling: {e}")
                 await asyncio.sleep(5)
 
+    async def _poll_kalshi_orderbooks(self) -> None:
+        """Poll Kalshi orderbooks for tickers in KALSHI_TICKERS at KALSHI_POLL_INTERVAL.
+
+        Mirrors _poll_orderbooks_fast: HTTP fetches run in parallel under a small
+        semaphore (default 4); DB inserts stay on the event loop. No-op when the
+        configured ticker set is empty.
+        """
+        tickers = sorted(KALSHI_TICKERS)
+        if not tickers:
+            return
+
+        logger.info(
+            f"Starting Kalshi orderbook polling (interval={KALSHI_POLL_INTERVAL}s, "
+            f"tickers={len(tickers)}, concurrency={KALSHI_CONCURRENCY})..."
+        )
+        sem = asyncio.Semaphore(KALSHI_CONCURRENCY)
+
+        async def fetch_one(t: str):
+            async with sem:
+                if not self.running:
+                    return None
+                parsed = await asyncio.to_thread(kalshi_client.fetch_orderbook, t)
+                return (t, parsed, int(time.time() * 1000))
+
+        while self.running:
+            try:
+                round_start = time.time()
+                results = await asyncio.gather(
+                    *(fetch_one(t) for t in tickers),
+                    return_exceptions=False,
+                )
+                for r in results:
+                    if not r:
+                        continue
+                    ticker, parsed, ts = r
+                    if not parsed:
+                        continue
+                    try:
+                        insert_kalshi_orderbook_snapshot(ticker, ts, parsed)
+                    except Exception as e:
+                        logger.debug(f"kalshi: persist failed for {ticker}: {e}")
+
+                elapsed = time.time() - round_start
+                remaining = KALSHI_POLL_INTERVAL - elapsed
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                else:
+                    logger.warning(
+                        f"Kalshi orderbook round took {elapsed:.1f}s "
+                        f"(>{KALSHI_POLL_INTERVAL}s tick, {len(tickers)} tickers)"
+                    )
+                    await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in Kalshi orderbook polling: {e}")
+                await asyncio.sleep(5)
+
+    async def _poll_kalshi_trades(self) -> None:
+        """Periodically pull new trades for each Kalshi ticker.
+
+        Uses get_last_kalshi_trade_ts as a cursor; INSERT OR IGNORE on trade_id
+        makes overlap safe. No-op when KALSHI_TICKERS is empty.
+        """
+        tickers = sorted(KALSHI_TICKERS)
+        if not tickers:
+            return
+
+        logger.info(
+            f"Starting Kalshi trades polling (interval={KALSHI_TRADES_POLL_INTERVAL}s, "
+            f"tickers={len(tickers)})..."
+        )
+
+        while self.running:
+            try:
+                for ticker in tickers:
+                    if not self.running:
+                        break
+                    try:
+                        since = await asyncio.to_thread(get_last_kalshi_trade_ts, ticker)
+                        new_trades = await asyncio.to_thread(
+                            kalshi_client.fetch_trades, ticker, since
+                        )
+                        if new_trades:
+                            await asyncio.to_thread(insert_kalshi_trades_batch, new_trades)
+                    except Exception as e:
+                        logger.debug(f"kalshi trades poll failed for {ticker}: {e}")
+                    await asyncio.sleep(0.1)
+                await asyncio.sleep(KALSHI_TRADES_POLL_INTERVAL)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in Kalshi trades polling: {e}")
+                await asyncio.sleep(5)
+
     async def run(self, markets: Optional[List[Dict[str, Any]]] = None) -> None:
         """
         Run the real-time collector.
@@ -826,6 +969,10 @@ class RealtimeCollector:
         if TRADES_POLL_ENABLED:
             self._trades_task = asyncio.create_task(self._poll_trades())
 
+        if KALSHI_TICKERS:
+            self._kalshi_orderbook_task = asyncio.create_task(self._poll_kalshi_orderbooks())
+            self._kalshi_trades_task = asyncio.create_task(self._poll_kalshi_trades())
+
         try:
             while self.running:
                 connected = await self.connect()
@@ -843,7 +990,13 @@ class RealtimeCollector:
                     )
         finally:
             # Clean up orderbook polling tasks
-            for task in (self._orderbook_task, self._orderbook_fast_task, self._trades_task):
+            for task in (
+                self._orderbook_task,
+                self._orderbook_fast_task,
+                self._trades_task,
+                self._kalshi_orderbook_task,
+                self._kalshi_trades_task,
+            ):
                 if task:
                     task.cancel()
                     try:

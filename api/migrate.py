@@ -310,6 +310,83 @@ def migrate(db_path: str | None = None):
     conn.commit()
     print("wallets + cs2_wallet_signals tables ready.")
 
+    # 5b. cs2_live_events table — manual round/map markers from the live marker CLI
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cs2_live_events (
+            id                  INTEGER PRIMARY KEY,
+            market_id           TEXT NOT NULL,
+            parent_event_id     TEXT,
+            pin_match_id        TEXT,
+            map_num             INTEGER,
+            event_type          TEXT NOT NULL,
+            wall_clock_ms_utc   INTEGER NOT NULL,
+            ct_score            INTEGER,
+            t_score             INTEGER,
+            winning_side        TEXT,
+            team_label          TEXT,
+            notes               TEXT,
+            created_at_ms       INTEGER NOT NULL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_live_events_market_ts ON cs2_live_events(market_id, wall_clock_ms_utc)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_live_events_parent ON cs2_live_events(parent_event_id, wall_clock_ms_utc)")
+    conn.commit()
+    print("cs2_live_events table ready.")
+
+    # 5c. Kalshi tables — parallel tracking of prediction-market price discovery
+    # for matches we already snapshot from Polymarket.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_markets (
+            ticker                TEXT PRIMARY KEY,
+            event_ticker          TEXT,
+            series_ticker         TEXT,
+            title                 TEXT,
+            team_label            TEXT,
+            side                  TEXT,
+            polymarket_market_id  TEXT,
+            map_num               INTEGER,
+            match_id_text         TEXT,
+            status                TEXT,
+            open_time             TEXT,
+            close_time            TEXT,
+            last_seen_at          INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_orderbook_snapshots (
+            id              INTEGER PRIMARY KEY,
+            ticker          TEXT NOT NULL,
+            timestamp       INTEGER NOT NULL,
+            yes_best_bid    REAL,
+            yes_best_ask    REAL,
+            no_best_bid     REAL,
+            no_best_ask     REAL,
+            yes_mid         REAL,
+            yes_spread      REAL,
+            yes_bids_json   TEXT,
+            yes_asks_json   TEXT,
+            no_bids_json    TEXT,
+            no_asks_json    TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_trades (
+            id               INTEGER PRIMARY KEY,
+            ticker           TEXT NOT NULL,
+            trade_id         TEXT UNIQUE,
+            created_time_ms  INTEGER NOT NULL,
+            taker_side       TEXT,
+            yes_price        REAL,
+            no_price         REAL,
+            count_fp         REAL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_obs_ticker_ts ON kalshi_orderbook_snapshots(ticker, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_trades_ticker_ts ON kalshi_trades(ticker, created_time_ms)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_markets_polymarket ON kalshi_markets(polymarket_market_id)")
+    conn.commit()
+    print("kalshi_markets / kalshi_orderbook_snapshots / kalshi_trades tables ready.")
+
     # 6. Backfill game_start_time from Gamma API for markets missing it
     print("Backfilling game_start_time...")
     _backfill_game_start_times(conn)

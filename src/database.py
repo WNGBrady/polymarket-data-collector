@@ -344,6 +344,82 @@ def init_database() -> None:
         )
     """)
 
+    # Manually-marked live game events (round ends, map starts, freeform notes)
+    # captured via tools/cs2_live_marker.py during a live match. Joined to
+    # orderbook_snapshots / pinnacle_snapshots in post-match analysis to
+    # validate Polymarket lead/lag against the GOTV demo's ground-truth clock.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cs2_live_events (
+            id                  INTEGER PRIMARY KEY,
+            market_id           TEXT NOT NULL,
+            parent_event_id     TEXT,
+            pin_match_id        TEXT,
+            map_num             INTEGER,
+            event_type          TEXT NOT NULL,
+            wall_clock_ms_utc   INTEGER NOT NULL,
+            ct_score            INTEGER,
+            t_score             INTEGER,
+            winning_side        TEXT,
+            team_label          TEXT,
+            notes               TEXT,
+            created_at_ms       INTEGER NOT NULL,
+            FOREIGN KEY (market_id) REFERENCES markets(market_id)
+        )
+    """)
+
+    # Kalshi: parallel tracking for prediction-market price discovery on the
+    # same matches we already snapshot from Polymarket. One row per Kalshi
+    # market ticker, optionally linked back to the equivalent Polymarket market.
+    # Each Kalshi binary contract (YES / NO sides for a team) is a separate row.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_markets (
+            ticker                TEXT PRIMARY KEY,
+            event_ticker          TEXT,
+            series_ticker         TEXT,
+            title                 TEXT,
+            team_label            TEXT,
+            side                  TEXT,
+            polymarket_market_id  TEXT,
+            map_num               INTEGER,
+            match_id_text         TEXT,
+            status                TEXT,
+            open_time             TEXT,
+            close_time            TEXT,
+            last_seen_at          INTEGER
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_orderbook_snapshots (
+            id              INTEGER PRIMARY KEY,
+            ticker          TEXT NOT NULL,
+            timestamp       INTEGER NOT NULL,
+            yes_best_bid    REAL,
+            yes_best_ask    REAL,
+            no_best_bid     REAL,
+            no_best_ask     REAL,
+            yes_mid         REAL,
+            yes_spread      REAL,
+            yes_bids_json   TEXT,
+            yes_asks_json   TEXT,
+            no_bids_json    TEXT,
+            no_asks_json    TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_trades (
+            id               INTEGER PRIMARY KEY,
+            ticker           TEXT NOT NULL,
+            trade_id         TEXT UNIQUE,
+            created_time_ms  INTEGER NOT NULL,
+            taker_side       TEXT,
+            yes_price        REAL,
+            no_price         REAL,
+            count_fp         REAL
+        )
+    """)
+
     # Create indexes for faster queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_market ON price_history(market_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_history_timestamp ON price_history(timestamp)")
@@ -374,6 +450,11 @@ def init_database() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_bot_label ON wallets(bot_label)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_volume ON wallets(total_volume_usd DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_signals_name ON cs2_wallet_signals(signal_name)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_live_events_market_ts ON cs2_live_events(market_id, wall_clock_ms_utc)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_live_events_parent ON cs2_live_events(parent_event_id, wall_clock_ms_utc)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_obs_ticker_ts ON kalshi_orderbook_snapshots(ticker, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_trades_ticker_ts ON kalshi_trades(ticker, created_time_ms)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_markets_polymarket ON kalshi_markets(polymarket_market_id)")
 
     conn.commit()
 
@@ -539,6 +620,80 @@ def migrate_database() -> None:
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_links_canonical ON pinnacle_match_links(canonical_match_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pin_snap_market_book ON pinnacle_snapshots(market_id, bookmaker, timestamp)")
+
+    # cs2_live_events: manual round-end / map-start markers captured during live
+    # matches. Created here so already-deployed DBs pick it up via migrate path.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cs2_live_events (
+            id                  INTEGER PRIMARY KEY,
+            market_id           TEXT NOT NULL,
+            parent_event_id     TEXT,
+            pin_match_id        TEXT,
+            map_num             INTEGER,
+            event_type          TEXT NOT NULL,
+            wall_clock_ms_utc   INTEGER NOT NULL,
+            ct_score            INTEGER,
+            t_score             INTEGER,
+            winning_side        TEXT,
+            team_label          TEXT,
+            notes               TEXT,
+            created_at_ms       INTEGER NOT NULL,
+            FOREIGN KEY (market_id) REFERENCES markets(market_id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_live_events_market_ts ON cs2_live_events(market_id, wall_clock_ms_utc)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs2_live_events_parent ON cs2_live_events(parent_event_id, wall_clock_ms_utc)")
+
+    # Kalshi: created here too so already-deployed DBs pick it up via migrate path.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_markets (
+            ticker                TEXT PRIMARY KEY,
+            event_ticker          TEXT,
+            series_ticker         TEXT,
+            title                 TEXT,
+            team_label            TEXT,
+            side                  TEXT,
+            polymarket_market_id  TEXT,
+            map_num               INTEGER,
+            match_id_text         TEXT,
+            status                TEXT,
+            open_time             TEXT,
+            close_time            TEXT,
+            last_seen_at          INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_orderbook_snapshots (
+            id              INTEGER PRIMARY KEY,
+            ticker          TEXT NOT NULL,
+            timestamp       INTEGER NOT NULL,
+            yes_best_bid    REAL,
+            yes_best_ask    REAL,
+            no_best_bid     REAL,
+            no_best_ask     REAL,
+            yes_mid         REAL,
+            yes_spread      REAL,
+            yes_bids_json   TEXT,
+            yes_asks_json   TEXT,
+            no_bids_json    TEXT,
+            no_asks_json    TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS kalshi_trades (
+            id               INTEGER PRIMARY KEY,
+            ticker           TEXT NOT NULL,
+            trade_id         TEXT UNIQUE,
+            created_time_ms  INTEGER NOT NULL,
+            taker_side       TEXT,
+            yes_price        REAL,
+            no_price         REAL,
+            count_fp         REAL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_obs_ticker_ts ON kalshi_orderbook_snapshots(ticker, timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_trades_ticker_ts ON kalshi_trades(ticker, created_time_ms)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kalshi_markets_polymarket ON kalshi_markets(polymarket_market_id)")
 
     conn.commit()
 
@@ -1022,6 +1177,65 @@ def insert_pinnacle_snapshot(
     conn.commit()
 
 
+def insert_live_event(
+    market_id: str,
+    event_type: str,
+    wall_clock_ms_utc: int,
+    parent_event_id: Optional[str] = None,
+    pin_match_id: Optional[str] = None,
+    map_num: Optional[int] = None,
+    ct_score: Optional[int] = None,
+    t_score: Optional[int] = None,
+    winning_side: Optional[str] = None,
+    team_label: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> int:
+    """Insert a manually-marked live game event. Returns the new row id."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO cs2_live_events
+        (market_id, parent_event_id, pin_match_id, map_num, event_type,
+         wall_clock_ms_utc, ct_score, t_score, winning_side, team_label, notes,
+         created_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        market_id, parent_event_id, pin_match_id, map_num, event_type,
+        wall_clock_ms_utc, ct_score, t_score, winning_side, team_label, notes,
+        int(time.time() * 1000),
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def delete_live_event(event_id: int) -> bool:
+    """Delete a previously-inserted live event (used by the marker tool's undo)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM cs2_live_events WHERE id = ?", (event_id,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_recent_live_events(market_ids: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+    """Return the most recent live events across the given market_ids, newest first."""
+    if not market_ids:
+        return []
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholders = ",".join("?" for _ in market_ids)
+    cursor.execute(
+        f"""
+        SELECT * FROM cs2_live_events
+        WHERE market_id IN ({placeholders})
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (*market_ids, limit),
+    )
+    return [dict(r) for r in cursor.fetchall()]
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -1168,3 +1382,128 @@ def get_stats() -> Dict[str, Any]:
     stats["markets_by_game"] = {row["game"]: row["cnt"] for row in cursor.fetchall()}
 
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Kalshi helpers
+# ---------------------------------------------------------------------------
+
+def upsert_kalshi_market(market: Dict[str, Any]) -> None:
+    """Insert/update a kalshi_markets row keyed by ticker."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO kalshi_markets
+            (ticker, event_ticker, series_ticker, title, team_label, side,
+             polymarket_market_id, map_num, match_id_text, status,
+             open_time, close_time, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            event_ticker         = COALESCE(excluded.event_ticker, kalshi_markets.event_ticker),
+            series_ticker        = COALESCE(excluded.series_ticker, kalshi_markets.series_ticker),
+            title                = COALESCE(excluded.title, kalshi_markets.title),
+            team_label           = COALESCE(excluded.team_label, kalshi_markets.team_label),
+            side                 = COALESCE(excluded.side, kalshi_markets.side),
+            polymarket_market_id = COALESCE(excluded.polymarket_market_id, kalshi_markets.polymarket_market_id),
+            map_num              = COALESCE(excluded.map_num, kalshi_markets.map_num),
+            match_id_text        = COALESCE(excluded.match_id_text, kalshi_markets.match_id_text),
+            status               = COALESCE(excluded.status, kalshi_markets.status),
+            open_time            = COALESCE(excluded.open_time, kalshi_markets.open_time),
+            close_time           = COALESCE(excluded.close_time, kalshi_markets.close_time),
+            last_seen_at         = COALESCE(excluded.last_seen_at, kalshi_markets.last_seen_at)
+    """, (
+        market.get("ticker"),
+        market.get("event_ticker"),
+        market.get("series_ticker"),
+        market.get("title"),
+        market.get("team_label"),
+        market.get("side"),
+        market.get("polymarket_market_id"),
+        market.get("map_num"),
+        market.get("match_id_text"),
+        market.get("status"),
+        market.get("open_time"),
+        market.get("close_time"),
+        market.get("last_seen_at") or int(time.time()),
+    ))
+    conn.commit()
+
+
+def insert_kalshi_orderbook_snapshot(
+    ticker: str,
+    timestamp: int,
+    parsed: Dict[str, Any],
+) -> Optional[int]:
+    """Insert one Kalshi orderbook snapshot. `parsed` is the dict returned by
+    src.kalshi.fetch_orderbook (keys: yes_bids/yes_asks/no_bids/no_asks +
+    derived best/mid/spread). Stores ladders as JSON for full reconstruction."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO kalshi_orderbook_snapshots
+            (ticker, timestamp,
+             yes_best_bid, yes_best_ask, no_best_bid, no_best_ask,
+             yes_mid, yes_spread,
+             yes_bids_json, yes_asks_json, no_bids_json, no_asks_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        ticker,
+        timestamp,
+        parsed.get("yes_best_bid"),
+        parsed.get("yes_best_ask"),
+        parsed.get("no_best_bid"),
+        parsed.get("no_best_ask"),
+        parsed.get("yes_mid"),
+        parsed.get("yes_spread"),
+        json.dumps(parsed.get("yes_bids") or []),
+        json.dumps(parsed.get("yes_asks") or []),
+        json.dumps(parsed.get("no_bids") or []),
+        json.dumps(parsed.get("no_asks") or []),
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def insert_kalshi_trades_batch(trades: List[Dict[str, Any]]) -> int:
+    """INSERT OR IGNORE trades; returns count of newly-inserted rows."""
+    if not trades:
+        return 0
+    conn = get_connection()
+    cursor = conn.cursor()
+    inserted = 0
+    for t in trades:
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO kalshi_trades
+                    (ticker, trade_id, created_time_ms, taker_side,
+                     yes_price, no_price, count_fp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                t.get("ticker"),
+                t.get("trade_id"),
+                t.get("created_time_ms"),
+                t.get("taker_side"),
+                t.get("yes_price"),
+                t.get("no_price"),
+                t.get("count_fp"),
+            ))
+            if cursor.rowcount:
+                inserted += 1
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    return inserted
+
+
+def get_last_kalshi_trade_ts(ticker: str) -> Optional[int]:
+    """Return max(created_time_ms) for a ticker, or None if no trades stored."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT MAX(created_time_ms) AS ts FROM kalshi_trades WHERE ticker = ?",
+        (ticker,),
+    )
+    row = cursor.fetchone()
+    if not row or row["ts"] is None:
+        return None
+    return int(row["ts"])

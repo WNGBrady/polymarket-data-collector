@@ -229,6 +229,15 @@ FAST_ORDERBOOK_POLL_INTERVAL = 10  # seconds
 FAST_ORDERBOOK_CONCURRENCY = 8  # parallel HTTP fetches per fast-tier round
 TIER1_CS2_KEYWORDS = ["iem", "esl pro league", "blast", "pgl"]
 
+# Per-match override: polls the listed market_ids on a tighter cadence (e.g. 2s)
+# while leaving every other fast-tier market on the default 10s. Intended as a
+# one-off env var set during a live match to capture lead/lag detail and
+# reverted after — not a permanent setting. Empty set = no override.
+FAST_OVERRIDE_MARKET_IDS = {
+    s.strip() for s in os.environ.get("FAST_OVERRIDE_MARKET_IDS", "").split(",") if s.strip()
+}
+FAST_OVERRIDE_INTERVAL = float(os.environ.get("FAST_OVERRIDE_INTERVAL", "2"))
+
 # Periodic trades polling in continuous mode. The historical backfill at startup
 # only pulls trades once per market; without this loop, trades for existing
 # markets stop flowing until the next service restart (the system was previously
@@ -250,6 +259,20 @@ MATCH_SNAPSHOT_DELAY = 2  # seconds to wait after match end before snapshotting
 PINNACLE_API_URL = os.environ.get("PINNACLE_API_URL", "http://127.0.0.1:8765")
 PINNACLE_HTTP_TIMEOUT = float(os.environ.get("PINNACLE_HTTP_TIMEOUT", "0.5"))
 PINNACLE_FUZZY_THRESHOLD = float(os.environ.get("PINNACLE_FUZZY_THRESHOLD", "0.85"))
+
+# Kalshi tracking. Off by default; enabled by setting KALSHI_TICKERS to a
+# comma-separated list of market tickers (e.g. KXCS2GAME-26MAY031330VITNAVI-VIT,...).
+# Both polling tasks no-op when the set is empty so the rest of the collector is
+# unaffected. Used per-match: set the env var on the systemd drop-in, restart,
+# revert after the match.
+KALSHI_API_BASE = os.environ.get("KALSHI_API_BASE", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_TICKERS = {
+    s.strip() for s in os.environ.get("KALSHI_TICKERS", "").split(",") if s.strip()
+}
+KALSHI_POLL_INTERVAL = float(os.environ.get("KALSHI_POLL_INTERVAL", "2.0"))
+KALSHI_TRADES_POLL_INTERVAL = float(os.environ.get("KALSHI_TRADES_POLL_INTERVAL", "60.0"))
+KALSHI_HTTP_TIMEOUT = float(os.environ.get("KALSHI_HTTP_TIMEOUT", "5.0"))
+KALSHI_CONCURRENCY = int(os.environ.get("KALSHI_CONCURRENCY", "4"))
 
 # Trading + sportsbook flags. main.py imports these unconditionally; the
 # corresponding code paths are gated behind these flags and only run when
